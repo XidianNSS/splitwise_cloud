@@ -1,16 +1,6 @@
 from typing import List, Optional
+
 from pydantic import BaseModel
-
-class ModelRegisterRequest(BaseModel):
-    """节点上线注册请求体"""
-    model_key: str
-    ip_address: str
-    port: int
-
-class ModelUnregisterRequest(BaseModel):
-    """节点主动下线请求体"""
-    ip_address: str
-    port: int
 
 class LoginRequest(BaseModel):
     username: str
@@ -35,7 +25,7 @@ class SessionInitResponse(BaseModel):
 
 
 class SessionInitRequest(BaseModel):
-    edge_device_ip: str
+    edge_device_ip: Optional[str] = ""
 
 class UserCreate(BaseModel):
     username: str
@@ -45,14 +35,14 @@ class DeviceCreate(BaseModel):
     id: str
     name: str
     value: str
-    device_type: str  # 👇 新增：用于接收前端传来的 'cloud' 或 'edge'
+    device_type: str
 
 
 class EdgeTriggerRequest(BaseModel):
     """边缘端发送给云端中枢的触发请求"""
     model_type: str
 
-# 👇 新增：对应截图中的每一层切分配置
+
 class LayerPartition(BaseModel):
     layer_id: int
     head_assignments: List[int]  # 0为边端，1为云端
@@ -66,13 +56,6 @@ class StrategyDisplayLayerPartition(BaseModel):
     edge_head_count: int
     cloud_head_count: int
 
-# 👇 新增：算法组回调我们接口时发送的总数据包
-class StrategyCallbackRequest(BaseModel):
-    task_id: str                 # 极其重要：用于匹配是哪次触发请求
-    model_type: str
-    layer_partitions: List[LayerPartition]
-
-
 class RuntimeDecisionPayload(BaseModel):
     layer_partitions: List[LayerPartition]
 
@@ -81,12 +64,6 @@ class StrategyDisplayDecisionPayload(BaseModel):
     layer_partitions: List[StrategyDisplayLayerPartition]
     edge_head_count_total: int
     cloud_head_count_total: int
-
-
-class RuntimeDispatchRequest(BaseModel):
-    task_id: str
-    model_type: str
-    decision: RuntimeDecisionPayload
 
 
 class RuntimeProgressCallbackRequest(BaseModel):

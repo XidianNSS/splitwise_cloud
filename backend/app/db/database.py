@@ -1,13 +1,23 @@
-from contextlib import contextmanager
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # __file__ 当前在 backend/app/db/database.py
 BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
+BACKEND_ENV_FILE = BASE_DIR / "backend" / ".env"
 
-# 拼接绝对路径：.../splitwise_cloud/data/cloud_edge.db
-DB_PATH = BASE_DIR / "data" / "cloud_edge.db"
+load_dotenv(BACKEND_ENV_FILE)
+
+# 默认拼接绝对路径：.../splitwise_cloud/data/cloud_edge.db
+db_path_value = os.getenv("SQLITE_DB_PATH", "data/cloud_edge.db")
+DB_PATH = Path(db_path_value)
+if not DB_PATH.is_absolute():
+    DB_PATH = BASE_DIR / DB_PATH
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(
@@ -22,16 +32,3 @@ SessionLocal = sessionmaker(
     bind=engine,
 )
 Base = declarative_base()
-
-
-@contextmanager
-def session_scope():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()

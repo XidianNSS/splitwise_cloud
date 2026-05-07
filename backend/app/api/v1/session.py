@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -9,6 +9,7 @@ from app.api.deps import (
     get_current_openwebui_payload,
     get_current_openwebui_user_id,
     get_db,
+    resolve_request_source_ip,
     resolve_edge_device_by_ip,
 )
 from app.models.models import Device, EdgeSession
@@ -21,6 +22,7 @@ router = APIRouter()
 
 @router.post("/session/init", response_model=SessionInitResponse, summary="使用 OpenWebUI token 初始化普通用户会话")
 async def init_openwebui_session(
+    request: Request,
     payload: SessionInitRequest,
     openwebui_payload: dict = Depends(get_current_openwebui_payload),
     openwebui_user_id: str = Depends(get_current_openwebui_user_id),
@@ -28,7 +30,11 @@ async def init_openwebui_session(
 ):
     openwebui_username = extract_claim(openwebui_payload, settings.OPENWEBUI_USERNAME_CLAIMS)
     openwebui_role = extract_claim(openwebui_payload, settings.OPENWEBUI_ROLE_CLAIMS)
-    edge_ip = payload.edge_device_ip.strip()
+    edge_ip = (payload.edge_device_ip or "").strip()
+    if not edge_ip:
+        edge_ip = (resolve_request_source_ip(request) or "").strip()
+    if not edge_ip:
+        raise HTTPException(status_code=400, detail="edge_device_ip 为空，且无法从请求来源解析边端设备 IP")
     edge_device = resolve_edge_device_by_ip(edge_ip, db)
     cloud_device = db.query(Device).filter(Device.id == "cloud").first()
     if not cloud_device:

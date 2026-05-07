@@ -1,9 +1,8 @@
 import re
 
 import httpx
-from sqlalchemy.orm import Session
 
-from app.models.models import ModelNode
+from app.core.config import settings
 
 
 def extract_ip(device_value: str) -> str | None:
@@ -11,34 +10,34 @@ def extract_ip(device_value: str) -> str | None:
     return ip_match.group(0) if ip_match else None
 
 
-def find_runtime_node(db: Session, device_id: str, model_key: str, node_role: str) -> ModelNode | None:
-    candidates = (
-        db.query(ModelNode)
-        .filter(
-            ModelNode.device_id == device_id,
-            ModelNode.node_role == node_role,
-            ModelNode.service_type == "runtime",
-            ModelNode.status == "online",
-        )
-        .order_by(ModelNode.last_heartbeat.desc())
-        .all()
-    )
+def resolve_runtime_control_target(node_role: str, device_ip: str) -> tuple[str, int, str]:
+    normalized_role = node_role.lower()
+    if normalized_role == "edge":
+        use_mock = settings.EDGE_RUNTIME_USE_MOCK
+        port = settings.EDGE_RUNTIME_MOCK_PORT if use_mock else settings.EDGE_RUNTIME_REAL_PORT
+        target_host = settings.EDGE_RUNTIME_MOCK_HOST if use_mock else (settings.EDGE_RUNTIME_REAL_HOST or device_ip)
+    elif normalized_role == "cloud":
+        use_mock = settings.CLOUD_RUNTIME_USE_MOCK
+        port = settings.CLOUD_RUNTIME_MOCK_PORT if use_mock else settings.CLOUD_RUNTIME_REAL_PORT
+        target_host = settings.CLOUD_RUNTIME_MOCK_HOST if use_mock else (settings.CLOUD_RUNTIME_REAL_HOST or device_ip)
+    else:
+        raise ValueError(f"不支持的 runtime 角色: {node_role}")
 
-    for node in candidates:
-        if (node.model_key or "").lower() == model_key:
-            return node
-
-    for node in candidates:
-        node_model_key = (node.model_key or "").lower()
-        if node_model_key in {"multi", "*", "all"}:
-            return node
-
-    return candidates[0] if len(candidates) == 1 else None
+    mode = "mock" if use_mock else "real"
+    return target_host, port, mode
 
 
-async def dispatch_strategy_to_runtime(node: ModelNode, payload: dict) -> None:
-    control_path = node.control_path or "/load_strategy"
-    runtime_url = f"http://{node.ip_address}:{node.port}{control_path}"
+def build_runtime_control_url(node_role: str, device_ip: str) -> str:
+    target_host, port, _mode = resolve_runtime_control_target(node_role, device_ip)
+    control_path = settings.RUNTIME_CONTROL_PATH or "/load_strategy"
+    return f"http://{target_host}:{port}{control_path}"
+
+
+async def dispatch_strategy_to_runtime(*, node_role: str, device_ip: str, payload: dict) -> dict:
+    runtime_url = build_runtime_control_url(node_role, device_ip)
     async with httpx.AsyncClient() as client:
         response = await client.post(runtime_url, json=payload, timeout=5.0)
         response.raise_for_status()
+        if response.content:
+            return response.json()
+    return {"status": "accepted"}

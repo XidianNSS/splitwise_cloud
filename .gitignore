@@ -6,7 +6,7 @@ __pycache__/
 venv/
 .venv/
 
-# 机密配置文件
+# 配置文件
 backend/.env
 monitor/.env
 

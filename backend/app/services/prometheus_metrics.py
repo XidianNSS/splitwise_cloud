@@ -82,7 +82,6 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
         "gpu_util_percent": round(gpu_util, 2),
         "gpu_mem_used_mb": round(gpu_used, 2),
         "gpu_mem_total_mb": round(gpu_used + gpu_free, 2) if (gpu_used + gpu_free) > 0 else 1.0,
-        "queue_len": 0.0,
     }
 
 
