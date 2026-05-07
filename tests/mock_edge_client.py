@@ -10,21 +10,24 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / "backend" / ".env")
 
-SESSION_INIT_URL = "http://127.0.0.1:8010/api/v1/session/init"
-TRIGGER_URL = "http://127.0.0.1:8010/api/v1/schedule/trigger"
-TASK_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}"
-STRATEGY_URL_TEMPLATE = "http://127.0.0.1:8010/api/v1/schedule/tasks/{task_id}/strategy"
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8010")
+SESSION_INIT_URL = f"{BACKEND_BASE_URL}/api/v1/session/init"
+TRIGGER_URL = f"{BACKEND_BASE_URL}/api/v1/schedule/trigger"
+TASK_URL_TEMPLATE = f"{BACKEND_BASE_URL}/api/v1/schedule/tasks/{{task_id}}"
+STRATEGY_URL_TEMPLATE = f"{BACKEND_BASE_URL}/api/v1/schedule/tasks/{{task_id}}/strategy"
+EDGE_FRONTEND_USE_MOCK = os.getenv("EDGE_FRONTEND_USE_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
 OPENWEBUI_JWT_SECRET = os.getenv("OPENWEBUI_JWT_SECRET", "")
 OPENWEBUI_JWT_ALGORITHM = os.getenv("OPENWEBUI_JWT_ALGORITHM", "HS256")
 OPENWEBUI_SKIP_SIGNATURE_VERIFY = os.getenv("OPENWEBUI_SKIP_SIGNATURE_VERIFY", "").strip().lower() in {"1", "true", "yes", "on"}
 EDGE_DEVICE_IP = os.getenv("EDGE_DEVICE_IP", "10.144.144.3")
+EDGE_FRONTEND_MOCK_MODEL_TYPE = os.getenv("EDGE_FRONTEND_MOCK_MODEL_TYPE", "Llama-3.2-3b")
 # 默认使用一个独立的模拟 OpenWebUI 用户 ID。
 # 如果需要联调真实 OpenWebUI 用户，可通过环境变量 OPENWEBUI_MOCK_USER_ID 覆盖。
 OPENWEBUI_MOCK_USER_ID = os.getenv("OPENWEBUI_MOCK_USER_ID", "mock-openwebui-user")
 OPENWEBUI_MOCK_EXPIRE_SECONDS = int(os.getenv("OPENWEBUI_MOCK_EXPIRE_SECONDS", "3600"))
 
 payload = {
-    "model_type": "llama-3.2-3b"
+    "model_type": EDGE_FRONTEND_MOCK_MODEL_TYPE
 }
 
 def build_mock_openwebui_token(openwebui_user_id: str) -> str:
@@ -53,6 +56,10 @@ def build_mock_openwebui_token(openwebui_user_id: str) -> str:
 
 print("🚀 边缘端正在使用 OpenWebUI token 初始化会话，并发送推理触发请求...")
 try:
+    if not EDGE_FRONTEND_USE_MOCK:
+        print("⏭️ EDGE_FRONTEND_USE_MOCK=false，当前不启动 mock 边端前端脚本。")
+        raise SystemExit(0)
+
     openwebui_token = build_mock_openwebui_token(OPENWEBUI_MOCK_USER_ID)
 
     auth_headers = {"Authorization": f"Bearer {openwebui_token}"}

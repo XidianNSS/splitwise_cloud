@@ -1,86 +1,75 @@
-from datetime import datetime
-
 from sqlalchemy.orm import Session
 
 from app.models.models import ScheduleTask
+from app.services.schedule_task_service import update_task
+
+STRATEGY_RUNNING_STATUS = "running_strategy"
+STRATEGY_QUEUED_STATUS = "queued_strategy"
+LOADING_RUNNING_STATUS = "running_loading"
 
 
-def find_active_task_for_device_pair(
-    db: Session,
-    *,
-    edge_device_id: str,
-    cloud_device_id: str,
-) -> ScheduleTask | None:
+def find_running_strategy_task(db: Session) -> ScheduleTask | None:
     return (
         db.query(ScheduleTask)
         .filter(
-            ScheduleTask.edge_device_id == edge_device_id,
-            ScheduleTask.cloud_device_id == cloud_device_id,
-            ScheduleTask.queue_status == "running",
+            ScheduleTask.queue_status == STRATEGY_RUNNING_STATUS,
             ScheduleTask.status.in_(["accepted", "running"]),
-            ScheduleTask.phase.in_(["strategy", "loading"]),
+            ScheduleTask.phase == "strategy",
         )
         .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
         .first()
     )
 
 
-def count_queued_tasks_for_device_pair(
-    db: Session,
-    *,
-    edge_device_id: str,
-    cloud_device_id: str,
-) -> int:
+def count_queued_strategy_tasks(db: Session) -> int:
     return (
         db.query(ScheduleTask)
         .filter(
-            ScheduleTask.edge_device_id == edge_device_id,
-            ScheduleTask.cloud_device_id == cloud_device_id,
-            ScheduleTask.queue_status == "queued",
+            ScheduleTask.queue_status == STRATEGY_QUEUED_STATUS,
             ScheduleTask.status == "accepted",
-            ScheduleTask.phase == "queued",
+            ScheduleTask.phase == "strategy",
         )
         .count()
     )
 
 
-def build_logical_queue_metrics(
-    db: Session,
-    *,
-    edge_device_id: str,
-    cloud_device_id: str,
-) -> dict:
-    queued_count = count_queued_tasks_for_device_pair(
-        db,
-        edge_device_id=edge_device_id,
-        cloud_device_id=cloud_device_id,
-    )
-    return {
-        "edge_queue_len": float(queued_count),
-        "cloud_queue_len": float(queued_count),
-    }
-
-
-def recalculate_queue_positions_for_device_pair(
-    db: Session,
-    *,
-    edge_device_id: str,
-    cloud_device_id: str,
-) -> None:
+def recalculate_strategy_queue_positions(db: Session) -> None:
     queued_tasks = (
         db.query(ScheduleTask)
         .filter(
-            ScheduleTask.edge_device_id == edge_device_id,
-            ScheduleTask.cloud_device_id == cloud_device_id,
-            ScheduleTask.queue_status == "queued",
+            ScheduleTask.queue_status == STRATEGY_QUEUED_STATUS,
             ScheduleTask.status == "accepted",
-            ScheduleTask.phase == "queued",
+            ScheduleTask.phase == "strategy",
         )
         .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
         .all()
     )
     for index, queued_task in enumerate(queued_tasks, start=1):
-        queued_task.queue_position = index
-        queued_task.updated_at = datetime.utcnow()
-        db.add(queued_task)
-    db.commit()
+        update_task(db, queued_task, queue_position=index)
+
+
+def promote_next_strategy_task(db: Session) -> ScheduleTask | None:
+    if find_running_strategy_task(db):
+        return None
+
+    next_task = (
+        db.query(ScheduleTask)
+        .filter(
+            ScheduleTask.queue_status == STRATEGY_QUEUED_STATUS,
+            ScheduleTask.status == "accepted",
+            ScheduleTask.phase == "strategy",
+        )
+        .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
+        .first()
+    )
+    if not next_task:
+        return None
+
+    next_task = update_task(
+        db,
+        next_task,
+        queue_status=STRATEGY_RUNNING_STATUS,
+        queue_position=0,
+    )
+    recalculate_strategy_queue_positions(db)
+    return next_task

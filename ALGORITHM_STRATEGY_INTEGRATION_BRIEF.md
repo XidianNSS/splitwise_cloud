@@ -1,15 +1,18 @@
 # 切分策略计算模块对接简版说明
 
-本文档用于给“切分策略计算模块”确认当前云端后端的真实对接协议。
+本文档说明当前云端后端与“切分策略计算模块”的真实对接协议。
 
-当前对接方式是：
+当前对接方式已经改成：
 
-1. 云端后端主动请求算法服务计算策略
-2. 算法服务先快速返回“已受理”
-3. 算法服务异步回调云端后端，提交最终切分策略
+1. 云端后端主动向算法服务发送一份完整环境 JSON
+2. 算法服务同步计算
+3. 算法服务直接在 HTTP Response 中返回切分策略 JSON
 
-当前**没有**在请求体里下发 `callback_url`。  
-默认由算法服务侧固定配置云端后端回调地址。
+当前采用的是单次同步请求模型：
+
+- 云端后端直接发送一份完整环境 JSON
+- 算法服务同步返回最终切分策略 JSON
+- 不再依赖旧的异步回调链路
 
 ---
 
@@ -23,17 +26,16 @@
 ALGORITHM_API_URL
 ```
 
-默认值：
+当前代码默认值：
 
 ```text
-http://10.144.144.2:5000/api/calculate
+http://127.0.0.1:8000/infer
 ```
 
 说明：
 
-- `ALGORITHM_API_URL` 需要根据算法计算模块的**真实服务地址**进行修改
-- 上面这个 `http://10.144.144.2:5000/api/calculate` 在当前项目里是 **mock_algorithm_server.py** 的模拟地址
-- 如果切换到真实算法服务，请将其改成真实可达地址
+- `ALGORITHM_API_URL` 需要根据算法模块真实服务地址修改
+- 当前本地 mock 联调时，也可以临时改到其他端口，例如 `http://127.0.0.1:5000/infer`
 
 ### 请求方法
 
@@ -49,119 +51,155 @@ Content-Type: application/json
 
 ### 请求体格式
 
+当前后端直接发送完整 JSON，不再做向量编码。
+
+示例：
+
 ```json
 {
-  "task_id": "87534955-99cb-4eed-8232-3dbfcd83010a",
-  "model_type": "llama-3.2-3b",
-  "state_vector": [
-    0.01,
-    0.02,
-    0.03,
-    0.04,
-    0.05,
-    0.06,
-    0.07,
-    0.08,
-    0.09,
-    0.10,
-    0.11,
-    0.12,
-    0.13,
-    0.14,
-    0.15,
-    0.16,
-    0.17,
-    0.18,
-    0.19,
-    0.20,
-    0.21,
-    0.22,
-    0.23,
-    0.24,
-    0.25,
-    0.26
-  ]
+  "model_type": "gpt2",
+  "prompt_len": 96,
+  "env": {
+    "edge": {
+      "device": "cpu",
+      "model_spec": {
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12
+      },
+      "metrics": {
+        "cpu_percent": 50.0,
+        "memory_percent": 50.0,
+        "gpu_util_percent": 0.0,
+        "gpu_mem_used_mb": 0,
+        "gpu_mem_total_mb": 1,
+        "queue_len": 4
+      },
+      "storage_limit_gb": 16
+    },
+    "cloud": {
+      "device": "cuda:0",
+      "model_spec": {
+        "num_hidden_layers": 12,
+        "num_attention_heads": 12
+      },
+      "metrics": {
+        "cpu_percent": 50.0,
+        "memory_percent": 50.0,
+        "gpu_util_percent": 50.0,
+        "gpu_mem_used_mb": 8000,
+        "gpu_mem_total_mb": 16000,
+        "queue_len": 4
+      }
+    },
+    "network": {
+      "edge_rtt_ms": 25.0,
+      "cloud_rtt_ms": 25.0,
+      "edge_to_cloud_rtt_ms": 25.0,
+      "estimated_bandwidth_mbps": 500.0,
+      "packet_loss": 0.2
+    }
+  }
 }
 ```
 
 ### 字段说明
 
-- `task_id`
-  - 字符串
-  - 本次调度任务唯一 ID
-  - 后续算法服务回调时必须原样带回
-
 - `model_type`
-  - 字符串
-  - 当前调度模型标识
+  - 当前请求的模型标识
   - 例如：
     - `gpt2`
     - `tinyllama`
-    - `llama-3.2-3b`
+    - `Llama-3.2-3b`
 
-- `state_vector`
-  - `list[float]`
-  - 当前实现为 **26 维状态向量**
-  - 算法服务只需要按既定模型输入处理即可
-  - 上面示例里已按 26 个浮点数完整展开
+- `prompt_len`
+  - 当前请求的提示词长度
+  - 当前后端固定发送 `96`
+
+- `env.edge.device`
+  - 边端设备运行标签
+  - 当前后端会根据 GPU 显存指标动态写成：
+    - `cpu`
+    - 或 `cuda:0`
+
+- `env.cloud.device`
+  - 云端设备运行标签
+  - 当前后端同样根据 GPU 显存指标动态写成：
+    - `cpu`
+    - 或 `cuda:0`
+
+- `env.edge.model_spec`
+- `env.cloud.model_spec`
+  - 当前只发送算法模块需要的最小模型规格：
+    - `num_hidden_layers`
+    - `num_attention_heads`
+
+- `env.edge.metrics`
+- `env.cloud.metrics`
+  - 当前后端发送真实或回退后的监控指标：
+    - `cpu_percent`
+    - `memory_percent`
+    - `gpu_util_percent`
+    - `gpu_mem_used_mb`
+    - `gpu_mem_total_mb`
+    - `queue_len`
+
+- `env.edge.storage_limit_gb`
+  - 仅边端包含该字段
+  - 当前由后端根据边端可用显存预算推导
+
+- `env.network`
+  - 当前网络相关指标：
+    - `edge_rtt_ms`
+    - `cloud_rtt_ms`
+    - `edge_to_cloud_rtt_ms`
+    - `estimated_bandwidth_mbps`
+    - `packet_loss`
 
 ### 云端后端当前行为
 
-- 请求超时设置：`2.0` 秒
-- 只要求算法服务**快速返回 2xx**
-- 云端后端不会在这个同步响应里读取最终策略结果
-- 真正的策略结果必须通过回调接口提交
+- 请求超时由配置项控制：
 
-### 建议同步响应
-
-推荐算法服务收到请求后立即返回：
-
-```json
-{
-  "status": "accepted"
-}
+```text
+ALGORITHM_API_TIMEOUT_SECONDS
 ```
 
-只要 HTTP 状态码是 `2xx`，当前云端后端就会视为“算法服务已受理”。
+- 当前默认值：
+
+```text
+30
+```
+
+- 后端会直接读取同步返回的 JSON
+- 不再等待异步回调
 
 ---
 
-## 2. 算法服务 -> 云端后端回调
+## 2. 算法服务 -> 云端后端同步响应
 
-### 回调地址
+### 响应格式
 
-```http
-POST /api/v1/schedule/strategy_callback
-```
+算法服务应直接返回最终切分策略 JSON。
 
 示例：
 
-```text
-http://10.144.144.2:8010/api/v1/schedule/strategy_callback
-```
-
-### 请求头
-
-```http
-Content-Type: application/json
-```
-
-### 回调请求体格式
-
 ```json
 {
-  "task_id": "87534955-99cb-4eed-8232-3dbfcd83010a",
-  "model_type": "llama-3.2-3b",
+  "status": "ok",
+  "model_type": "gpt2",
   "layer_partitions": [
     {
       "layer_id": 0,
-      "head_assignments": [0, 1, 0, 1],
-      "ffn_assignment": 0
+      "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      "ffn_assignment": 1,
+      "edge_heads": 0,
+      "cloud_heads": 12
     },
     {
       "layer_id": 1,
-      "head_assignments": [1, 0, 1, 0],
-      "ffn_assignment": 1
+      "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+      "ffn_assignment": 1,
+      "edge_heads": 0,
+      "cloud_heads": 12
     }
   ]
 }
@@ -169,25 +207,26 @@ Content-Type: application/json
 
 ### 字段说明
 
-- `task_id`
-  - 必填
-  - 必须与云端后端最初请求中的 `task_id` 完全一致
+- `status`
+  - 建议返回 `ok`
+  - 当前后端会校验该字段；如果存在且不是 `ok`，则视为算法异常
 
 - `model_type`
-  - 必填
-  - 建议与请求中的 `model_type` 保持一致
+  - 建议返回本次请求对应的模型标识
 
 - `layer_partitions`
   - 必填
-  - 每一层的切分决策列表
+  - 每层切分结果数组
 
 #### `layer_partitions[*]` 格式
 
 ```json
 {
   "layer_id": 0,
-  "head_assignments": [0, 1, 0, 1],
-  "ffn_assignment": 0
+  "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  "ffn_assignment": 1,
+  "edge_heads": 0,
+  "cloud_heads": 12
 }
 ```
 
@@ -197,108 +236,60 @@ Content-Type: application/json
   - 当前层编号
 
 - `head_assignments`
-  - 当前层 attention heads 的分配结果
-  - `0` 表示分配到边端
-  - `1` 表示分配到云端
+  - 当前层 attention heads 的切分结果
+  - `0` 表示边端
+  - `1` 表示云端
 
 - `ffn_assignment`
-  - 当前层 FFN 的分配结果
+  - 当前层 FFN 的切分结果
   - `0` 表示边端
   - `1` 表示云端
   - `2` 表示拆分
 
+- `edge_heads`
+  - 当前层分给边端的 head 数量
+
+- `cloud_heads`
+  - 当前层分给云端的 head 数量
+
+说明：
+
+- 当前后端会优先信任 `head_assignments`
+- 如果响应中带了 `edge_heads` / `cloud_heads`，后端会一并保留并用于内部标准化结果
+
 ---
 
-## 3. 云端后端收到回调后的行为
+## 3. 云端后端收到同步响应后的行为
 
-当回调成功后，云端后端会：
+当算法服务同步返回成功后，云端后端会：
 
-1. 用 `task_id` 匹配挂起中的调度任务
-2. 保存策略结果
-3. 查找边端 runtime 和云端 runtime
-4. 向两边下发 `/load_strategy`
-5. 等待两边 runtime 回调加载进度
+1. 校验 `status`
+2. 校验并解析 `layer_partitions`
+3. 将结果保存到任务的 `strategy_payload`
+4. 进入加载资源判定
+5. 向边端模型推理服务和云端模型推理服务下发 `/load_strategy`
+6. 等待两边模型推理服务回调加载进度
 
 因此，对算法服务来说，最关键的是：
 
-- `task_id` 必须准确
-- `layer_partitions` 结构必须符合格式
+- 能正确接收新的环境 JSON
+- 能同步返回合法的 `layer_partitions`
 
 ---
 
-## 4. 成功响应
+## 4. 当前对算法模块的最小要求
 
-云端后端回调接口成功时返回：
+当前算法模块只需要满足两点：
 
-```json
-{
-  "status": "success",
-  "message": "任务 87534955-99cb-4eed-8232-3dbfcd83010a 切分策略已成功接收并交付"
-}
-```
+- 能正确接收 `model_type + prompt_len + env JSON`
+- 能在同一个 HTTP Response 中同步返回合法的切分策略 JSON
+
+旧的 `task_id`、`state_vector` 与 `strategy_callback` 回调链路，当前都已经退出主流程，不需要再兼容。
 
 ---
 
-## 5. 失败情况
-
-### 任务不存在或超时
-
-如果回调时 `task_id` 已失效，云端后端会返回：
-
-```json
-{
-  "detail": "未找到对应的任务ID，或任务已超时废弃"
-}
-```
-
-对应 HTTP 状态码：
-
-```text
-404
-```
-
-当前云端后端在发出算法请求后，会等待回调结果：
-
-- 最长等待时间：`30` 秒
-
-所以建议算法服务在 30 秒内完成回调。
-
----
-
-## 6. 对接建议
-
-算法同学侧最少只需要保证两件事：
-
-1. 能接收以下格式的计算请求
-
-```json
-{
-  "task_id": "string",
-  "model_type": "string",
-  "state_vector": [
-    0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10,
-    0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20,
-    0.21, 0.22, 0.23, 0.24, 0.25, 0.26
-  ]
-}
-```
-
-2. 能按以下格式回调策略结果
-
-```json
-{
-  "task_id": "string",
-  "model_type": "string",
-  "layer_partitions": [
-    {
-      "layer_id": 0,
-      "head_assignments": [0, 1, 0, 1],
-      "ffn_assignment": 0
-    }
-  ]
-}
-```
+## 5. 对接结论
 
 一句话总结：
 
-**云端后端发 `task_id + model_type + 26维 state_vector`，算法服务回 `task_id + model_type + layer_partitions`。**
+**云端后端现在直接发 `model_type + prompt_len + env JSON` 到 `/infer`，算法服务直接同步返回 `status + model_type + layer_partitions`。**

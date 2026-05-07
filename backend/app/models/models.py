@@ -15,7 +15,7 @@ class Device(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String)
     value: Mapped[str] = mapped_column(String)
-    device_type: Mapped[str] = mapped_column(String, default="edge")  # 👇 新增：记录设备类型
+    device_type: Mapped[str] = mapped_column(String, default="edge")
 
 
 class User(Base):
@@ -24,25 +24,6 @@ class User(Base):
     username: Mapped[str] = mapped_column(String, unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String)
     role: Mapped[str] = mapped_column(String)
-
-
-class ModelNode(Base):
-    """
-    模型切分节点服务注册表
-    """
-    __tablename__ = "model_nodes"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    model_key: Mapped[str | None] = mapped_column(String, index=True)  # 例如: "gpt2" / "llama-3.2-3b"
-    device_id: Mapped[str | None] = mapped_column(String, index=True)  # 对应 Device.id，例如 cloud / edge_A
-    node_role: Mapped[str] = mapped_column(String, default="edge")  # edge / cloud
-    service_type: Mapped[str] = mapped_column(String, default="runtime")  # runtime / monitor 等
-    ip_address: Mapped[str | None] = mapped_column(String, index=True)  # 节点IP
-    port: Mapped[int | None] = mapped_column(Integer, index=True)  # 节点端口 (如 8001, 8002)
-    control_path: Mapped[str] = mapped_column(String, default="/load_strategy")  # 下发策略的控制接口路径
-    supported_models: Mapped[str | None] = mapped_column(Text, nullable=True)  # 多模型 runtime 支持的模型列表(JSON)
-    status: Mapped[str] = mapped_column(String, default="online")  # "online" 或 "offline"
-    last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)  # 最后活跃时间
 
 
 class ScheduleTask(Base):

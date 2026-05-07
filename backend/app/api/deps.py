@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt import PyJWTError
 
@@ -82,6 +82,23 @@ def resolve_edge_device_by_ip(edge_device_ip: str, db) -> Device:
             return device
 
     raise HTTPException(status_code=403, detail=f"edge_device_ip={candidate_ip} 未匹配到已登记的边端设备")
+
+
+def resolve_request_source_ip(request: Request) -> str | None:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        candidate = forwarded_for.split(",")[0].strip()
+        if candidate:
+            return candidate
+
+    real_ip = request.headers.get("x-real-ip", "").strip()
+    if real_ip:
+        return real_ip
+
+    if request.client and request.client.host:
+        return request.client.host.strip()
+
+    return None
 
 
 async def get_current_edge_session(
