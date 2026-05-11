@@ -1,4 +1,4 @@
-# Splitwise Cloud Edge 云端后端
+# Splitwise 云端后端
 
 ## 项目定位
 
