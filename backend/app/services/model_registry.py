@@ -29,6 +29,16 @@ MODEL_REGISTRY = {
         "edge_min_free_gpu_mem_mb": 12288,
         "cloud_min_free_gpu_mem_mb": 12288,
     },
+    "llama-3.2-3b-instruct": {
+        "architecture": "llama",
+        "num_hidden_layers": 28,
+        "num_attention_heads": 24,
+        "hidden_size": 3072,
+        "intermediate_size": 8192,
+        "vocab_size": 128256,
+        "edge_min_free_gpu_mem_mb": None,
+        "cloud_min_free_gpu_mem_mb": None,
+    },
 }
 
 
@@ -36,12 +46,14 @@ MODEL_CANONICAL_NAMES = {
     "gpt2": "gpt2",
     "tinyllama": "tinyllama",
     "llama-3.2-3b": "Llama-3.2-3b",
+    "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
 }
 
 MODEL_RUNTIME_NAMES = {
     "gpt2": "gpt2",
     "tinyllama": "tinyllama",
     "llama-3.2-3b": "Llama-3.2-3B",
+    "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
 }
 
 
