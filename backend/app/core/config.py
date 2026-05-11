@@ -1,11 +1,9 @@
 import os
 from pathlib import Path
-from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-BACKEND_ENV_FILE = PROJECT_ROOT / "backend" / ".env"
+from app.core.env_loader import PROJECT_ROOT, load_backend_env
 
-load_dotenv(BACKEND_ENV_FILE)
+load_backend_env()
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -16,7 +14,6 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 class Settings:
-    # 优先读取环境变量，如果没找到则使用后面的默认值作为兜底
     SECRET_KEY: str = os.getenv("SECRET_KEY", "default-fallback-secret")
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_HOURS: int = 24
@@ -37,7 +34,6 @@ class Settings:
     OPENWEBUI_EXPECTED_ISSUER: str = os.getenv("OPENWEBUI_EXPECTED_ISSUER", "")
     OPENWEBUI_EXPECTED_AUDIENCE: str = os.getenv("OPENWEBUI_EXPECTED_AUDIENCE", "")
 
-    # 服务器配置
     HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
     PORT: int = int(os.getenv("SERVER_PORT", 8010))
     PUBLIC_BASE_URL: str = os.getenv("SERVER_PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}")
@@ -58,10 +54,9 @@ class Settings:
     MODEL_STARTUP_RESOURCE_CHECK_ENABLED: bool = env_bool("MODEL_STARTUP_RESOURCE_CHECK_ENABLED", True)
     MODEL_STARTUP_MAX_MEMORY_PERCENT: float = float(os.getenv("MODEL_STARTUP_MAX_MEMORY_PERCENT", 95.0))
 
-    # 外部服务配置
     PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.2:9090")
     ALGORITHM_USE_MOCK: bool = env_bool("ALGORITHM_USE_MOCK", False)
-    ALGORITHM_REAL_API_URL: str = os.getenv("ALGORITHM_REAL_API_URL", "http://127.0.0.1:8000/infer")
+    ALGORITHM_REAL_API_URL: str = os.getenv("ALGORITHM_REAL_API_URL", "http://127.0.0.1:8050/infer")
     ALGORITHM_MOCK_API_URL: str = os.getenv("ALGORITHM_MOCK_API_URL", "http://127.0.0.1:5000/infer")
     ALGORITHM_API_URL: str = ALGORITHM_MOCK_API_URL if ALGORITHM_USE_MOCK else ALGORITHM_REAL_API_URL
     ALGORITHM_API_TIMEOUT_SECONDS: float = float(os.getenv("ALGORITHM_API_TIMEOUT_SECONDS", 30.0))

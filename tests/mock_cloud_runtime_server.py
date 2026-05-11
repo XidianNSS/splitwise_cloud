@@ -10,7 +10,10 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Mock Cloud Model Service")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / "backend" / ".env")
+ENV_FILE = Path(os.getenv("BACKEND_ENV_FILE", str(PROJECT_ROOT / "backend" / ".env")))
+if not ENV_FILE.is_absolute():
+    ENV_FILE = PROJECT_ROOT / ENV_FILE
+load_dotenv(ENV_FILE)
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8010")
 RUNTIME_CALLBACK_URL = f"{BACKEND_BASE_URL}/api/v1/schedule/runtime_callback/cloud"

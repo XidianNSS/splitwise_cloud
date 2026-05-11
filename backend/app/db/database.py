@@ -1,21 +1,20 @@
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# __file__ 当前在 backend/app/db/database.py
-BASE_DIR = Path(__file__).resolve().parent.parent.parent.parent
-BACKEND_ENV_FILE = BASE_DIR / "backend" / ".env"
+from app.core.env_loader import PROJECT_ROOT, load_backend_env
 
-load_dotenv(BACKEND_ENV_FILE)
+load_backend_env()
 
-# 默认拼接绝对路径：.../splitwise_cloud/data/cloud_edge.db
+# 默认拼接绝对路径：<project>/data/cloud_edge.db
+base_dir = PROJECT_ROOT
+
 db_path_value = os.getenv("SQLITE_DB_PATH", "data/cloud_edge.db")
 DB_PATH = Path(db_path_value)
 if not DB_PATH.is_absolute():
-    DB_PATH = BASE_DIR / DB_PATH
+    DB_PATH = base_dir / DB_PATH
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"

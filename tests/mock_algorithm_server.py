@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 
 app = FastAPI(title="Mock 算法切分服务")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(PROJECT_ROOT / "backend" / ".env")
+ENV_FILE = Path(os.getenv("BACKEND_ENV_FILE", str(PROJECT_ROOT / "backend" / ".env")))
+if not ENV_FILE.is_absolute():
+    ENV_FILE = PROJECT_ROOT / ENV_FILE
+load_dotenv(ENV_FILE)
 ALGORITHM_USE_MOCK = os.getenv("ALGORITHM_USE_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
 ALGORITHM_DELAY_SECONDS = float(os.getenv("ALGORITHM_MOCK_DELAY_SECONDS", "6.0"))
 DEFAULT_MOCK_API_URL = os.getenv("ALGORITHM_MOCK_API_URL", "http://127.0.0.1:5000/infer")
@@ -103,7 +106,7 @@ def build_strategy_response(req: InferRequest) -> dict:
 
     if req.model_type.lower() == "gpt2" and num_layers == 12 and num_heads == 12:
         layer_partitions = GPT2_SAMPLE_LAYER_PARTITIONS
-    elif req.model_type.lower() == "llama-3.2-3b":
+    elif req.model_type.lower() in {"llama-3.2-3b", "llama-3.2-3b-instruct"}:
         return LLAMA32_3B_SAMPLE_RESPONSE
     else:
         layer_partitions = build_generic_layer_partitions(num_layers, num_heads)

@@ -29,7 +29,7 @@ ALGORITHM_API_URL
 当前代码默认值：
 
 ```text
-http://127.0.0.1:8000/infer
+http://127.0.0.1:8050/infer
 ```
 
 说明：
