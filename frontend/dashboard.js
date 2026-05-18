@@ -212,7 +212,8 @@ async function loadSystemDevices() {
 function switchGrafanaDevice() {
     const val = document.getElementById("custom-device-selector").value;
     if (!val) return;
-    document.getElementById("grafana-frame").src = `http://10.144.144.2:3000/d/ad9hqhg/b9a97b3?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(val)}`;
+    const ip = val.split(":")[0];
+    document.getElementById("grafana-frame").src = `http://10.144.144.2:3000/d/ad9hqhg/b9a97b3?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(ip)}`;
 }
 
 function switchView(viewId, navElement) {
