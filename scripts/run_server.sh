@@ -9,6 +9,50 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BACKEND_DIR="$PROJECT_ROOT/backend"
 ENV_FILE_PATH="${BACKEND_ENV_FILE:-$BACKEND_DIR/.env}"
+WYY_ENV_PATH="$BACKEND_DIR/.env.wyy"
+if [ "${ENV_FILE_PATH#/}" = "$ENV_FILE_PATH" ]; then
+    ENV_FILE_PATH="$PROJECT_ROOT/$ENV_FILE_PATH"
+fi
+
+choose_available_port() {
+    local preferred_port="$1"
+    local candidate="$preferred_port"
+    while ss -ltn | grep -q ":${candidate}\b"; do
+        candidate=$((candidate + 1))
+    done
+    echo "$candidate"
+}
+
+apply_wyy_port_override_if_needed() {
+    if [ "$ENV_FILE_PATH" != "$WYY_ENV_PATH" ]; then
+        return
+    fi
+    local configured_port
+    configured_port=$(grep '^SERVER_PORT=' "$ENV_FILE_PATH" | cut -d'=' -f2)
+    if [ -z "$configured_port" ]; then
+        return
+    fi
+    local selected_port
+    selected_port=$(choose_available_port "$configured_port")
+    if [ "$selected_port" != "$configured_port" ]; then
+        echo "⚠️ 检测到端口 $configured_port 已被占用，WYY 开发环境自动切换到端口 $selected_port"
+        python - <<PY2
+from pathlib import Path
+path = Path(r"$ENV_FILE_PATH")
+lines = path.read_text().splitlines()
+updates = {
+    "SERVER_PORT": "$selected_port",
+    "SERVER_PUBLIC_BASE_URL": "http://10.144.144.2:$selected_port",
+    "BACKEND_BASE_URL": "http://10.144.144.2:$selected_port",
+}
+for idx, line in enumerate(lines):
+    for key, value in updates.items():
+        if line.startswith(f"{key}="):
+            lines[idx] = f"{key}={value}"
+path.write_text("\n".join(lines) + "\n")
+PY2
+    fi
+}
 
 VENV_PATH="$PROJECT_ROOT/venv/bin/activate"
 if [ -f "$VENV_PATH" ]; then
@@ -20,10 +64,18 @@ else
 fi
 
 echo "🌐 正在拉起 FastAPI 服务与监控大屏..."
+if [ -z "${BACKEND_ENV_FILE:-}" ] && [ -f "$WYY_ENV_PATH" ]; then
+    echo "💡 检测到开发隔离配置: $WYY_ENV_PATH"
+    echo "💡 如需运行并发控制开发版，可使用：BACKEND_ENV_FILE=backend/.env.wyy bash scripts/run_server.sh"
+fi
+apply_wyy_port_override_if_needed
 cd "$BACKEND_DIR"
 
 if [ -f "$ENV_FILE_PATH" ]; then
     echo "🧾 使用环境配置: $ENV_FILE_PATH"
+    if [ "$ENV_FILE_PATH" = "$WYY_ENV_PATH" ]; then
+        echo "🧪 当前运行的是 WYY 并发控制开发环境（独立端口 / 独立数据库）。"
+    fi
     set -a
     source "$ENV_FILE_PATH"
     set +a

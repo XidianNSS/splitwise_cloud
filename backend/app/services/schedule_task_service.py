@@ -27,6 +27,11 @@ def update_task(
     error_detail: str | None = None,
     edge_device_id: str | None = None,
     cloud_device_id: str | None = None,
+    runtime_binding_id: str | None = None,
+    edge_slot_id: str | None = None,
+    cloud_slot_id: str | None = None,
+    allocated_cloud_slot_id: str | None = None,
+    spawned_cloud_slot: str | None = None,
 ) -> ScheduleTask:
     if status is not None:
         task.status = status
@@ -60,6 +65,16 @@ def update_task(
         task.edge_device_id = edge_device_id
     if cloud_device_id is not None:
         task.cloud_device_id = cloud_device_id
+    if runtime_binding_id is not None:
+        task.runtime_binding_id = runtime_binding_id
+    if edge_slot_id is not None:
+        task.edge_slot_id = edge_slot_id
+    if cloud_slot_id is not None:
+        task.cloud_slot_id = cloud_slot_id
+    if allocated_cloud_slot_id is not None:
+        task.allocated_cloud_slot_id = allocated_cloud_slot_id
+    if spawned_cloud_slot is not None:
+        task.spawned_cloud_slot = spawned_cloud_slot
 
     if phase_progress is not None:
         task.phase_progress = clamp_progress(phase_progress)

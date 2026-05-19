@@ -18,6 +18,7 @@
 - `backend/app/`：后端主程序
 - `backend/.env`：正式运行配置
 - `backend/.env.dev`：开发隔离配置
+- `backend/.env.wyy`：WYY 并发控制开发隔离配置
 - `scripts/run_server.sh`：正式版启动脚本
 - `scripts/run_server_dev.sh`：开发版启动脚本
 - `tests/`：mock 前端、mock 算法服务、mock 模型推理服务
@@ -26,6 +27,7 @@
 当前数据库：
 - 正式版：`data/cloud_edge.db`
 - 开发版：`data/cloud_edge_dev.db`
+- WYY 并发控制开发版：`data/cloud_edge_wyy.db`
 
 ## 主要代码模块介绍
 
@@ -174,6 +176,24 @@ bash scripts/run_server_dev.sh
 - 自联调
 - 不希望影响当前正在运行的正式系统
 
+### 3. WYY 并发控制开发版运行
+
+WYY 开发版使用：
+- 配置文件：`backend/.env.wyy`
+- 后端端口：`18121`
+- 数据库：`data/cloud_edge_wyy.db`
+- 对接 ModelSplit WYY 开发 runtime：edge `9112` / cloud `9113`
+
+启动命令：
+```bash
+BACKEND_ENV_FILE=backend/.env.wyy bash scripts/run_server.sh
+```
+
+适用场景：
+- 并发控制功能开发
+- 不希望影响当前 prod 调度中枢和正式数据库
+- 需要与 `ModelSplit/.env.wyy` 这套开发 runtime 组合联调
+
 ## 正式版与开发版是否可以同时运行
 
 可以。
@@ -181,13 +201,19 @@ bash scripts/run_server_dev.sh
 当前已经完成以下隔离：
 - 正式版和开发版使用不同端口
 - 正式版和开发版使用不同数据库
+- WYY 并发控制开发版进一步使用独立端口 `18121` 与独立数据库 `data/cloud_edge_wyy.db`
 - mock 脚本支持跟随 `BACKEND_ENV_FILE` 切换环境配置
 
 ## 开发版配套 mock 如何使用
 
 如果要让开发版后端配套 mock 一起运行，请先在当前 shell 中设置：
 ```bash
-export BACKEND_ENV_FILE=/home/nss-d/wyy/splitwise_cloud_next/backend/.env.dev
+export BACKEND_ENV_FILE=/home/nss-d/wyy/splitwise_cloud_dev/backend/.env.dev
+```
+
+如果要让 WYY 并发控制开发版后端配套 mock 一起运行，请改为：
+```bash
+export BACKEND_ENV_FILE=/home/nss-d/wyy/splitwise_cloud_dev/backend/.env.wyy
 ```
 
 然后启动 mock：

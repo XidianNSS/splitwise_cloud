@@ -10,14 +10,19 @@ from app.api.deps import (
     get_current_edge_session,
     get_current_openwebui_user_id,
     get_db,
+    verify_runtime_integrity_token,
 )
 from app.core.config import settings
 from app.core.security import decode_openwebui_access_token
 from app.db.database import SessionLocal
-from app.models.models import EdgeSession, ScheduleTask
+from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
 from app.schemas.schemas import (
+    CloudRuntimeConfirmationRequest,
+    CloudRuntimeConfirmationResponse,
     EdgeTriggerRequest,
     RuntimeProgressCallbackRequest,
+    RuntimeBindingStatusResponse,
+    RuntimeSlotStatusResponse,
     ScheduleTaskAcceptedResponse,
     ScheduleTaskStrategyResponse,
     ScheduleTaskStatusResponse,
@@ -27,9 +32,13 @@ from app.services.schedule_orchestrator import (
     accept_schedule_task,
     handle_runtime_progress,
 )
+from app.services.schedule_queue import LOADING_RUNNING_STATUS, WAITING_CLOUD_SLOT_STATUS
+from app.services.runtime_control_service import forward_cloud_confirmation_to_edge
 from app.services.schedule_presenter import (
     build_strategy_display_layer_partitions,
     build_strategy_display_summary,
+    serialize_runtime_binding,
+    serialize_runtime_slot,
     serialize_task,
 )
 
@@ -61,6 +70,45 @@ async def collect_raw_json(
         edge_session=edge_session,
         requested_model_type=request.model_type,
     )
+
+
+@router.get("/runtime/slots", response_model=list[RuntimeSlotStatusResponse], summary="查询当前 runtime slot 状态")
+async def list_runtime_slots(
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    db: Session = Depends(get_db),
+):
+    _ = current_openwebui_user_id
+    slots = db.query(RuntimeSlot).order_by(RuntimeSlot.role.asc(), RuntimeSlot.slot_id.asc()).all()
+    return [serialize_runtime_slot(slot) for slot in slots]
+
+
+@router.get("/runtime/bindings", response_model=list[RuntimeBindingStatusResponse], summary="查询当前 runtime binding 状态")
+async def list_runtime_bindings(
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    db: Session = Depends(get_db),
+):
+    _ = current_openwebui_user_id
+    bindings = db.query(RuntimeBinding).order_by(RuntimeBinding.created_at.asc(), RuntimeBinding.binding_id.asc()).all()
+    return [serialize_runtime_binding(binding) for binding in bindings]
+
+
+@router.get("/queue/loading", response_model=list[ScheduleTaskStatusResponse], summary="查询当前 loading/waiting 队列状态")
+async def list_loading_queue(
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    db: Session = Depends(get_db),
+):
+    tasks = (
+        db.query(ScheduleTask)
+        .filter(
+            ScheduleTask.openwebui_user_id == current_openwebui_user_id,
+            ScheduleTask.phase == "loading",
+            ScheduleTask.queue_status.in_([LOADING_RUNNING_STATUS, WAITING_CLOUD_SLOT_STATUS]),
+            ScheduleTask.status.in_(["accepted", "running"]),
+        )
+        .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
+        .all()
+    )
+    return [serialize_task(task) for task in tasks]
 
 
 @router.get("/tasks/{task_id}", response_model=ScheduleTaskStatusResponse, summary="查询调度任务状态")
@@ -113,6 +161,44 @@ async def get_schedule_task_strategy(
             "cloud_head_count_total": display_summary["cloud_head_count_total"],
         },
     }
+
+
+@router.post(
+    "/runtime/confirmation/cloud",
+    response_model=CloudRuntimeConfirmationResponse,
+    summary="接收 cloud runtime 完整性确认并中转到 edge runtime",
+)
+async def confirm_cloud_runtime_integrity(
+    payload: CloudRuntimeConfirmationRequest,
+    _verified: None = Depends(verify_runtime_integrity_token),
+    db: Session = Depends(get_db),
+):
+    task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="未找到对应的调度任务")
+    if payload.cloud_slot_id and task.allocated_cloud_slot_id and payload.cloud_slot_id != task.allocated_cloud_slot_id:
+        raise HTTPException(status_code=409, detail="cloud_slot_id 与任务分配不一致")
+
+    cloud_slot_id = task.allocated_cloud_slot_id or task.cloud_slot_id
+    edge_slot_id = task.edge_slot_id
+    cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == cloud_slot_id).first() if cloud_slot_id else None
+    edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == edge_slot_id).first() if edge_slot_id else None
+    if cloud_slot is None or edge_slot is None:
+        raise HTTPException(status_code=409, detail="任务对应的 runtime slot 不完整")
+
+    matched, reason = await forward_cloud_confirmation_to_edge(
+        edge_slot=edge_slot,
+        payload=payload,
+    )
+
+    if matched:
+        cloud_slot.confirmation_status = "passed"
+    else:
+        cloud_slot.confirmation_status = "failed"
+    db.add(cloud_slot)
+    db.commit()
+
+    return CloudRuntimeConfirmationResponse(matched=matched, reason=reason)
 
 
 @router.get("/tasks/{task_id}/stream", summary="SSE 推送调度任务进度")

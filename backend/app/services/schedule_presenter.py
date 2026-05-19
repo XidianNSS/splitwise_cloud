@@ -30,6 +30,12 @@ def serialize_task(task: ScheduleTask) -> dict:
         "cloud_status": task.cloud_status,
         "edge_message": task.edge_message,
         "cloud_message": task.cloud_message,
+        "queue_status": task.queue_status,
+        "queue_position": task.queue_position,
+        "runtime_binding_id": task.runtime_binding_id,
+        "edge_slot_id": task.edge_slot_id,
+        "cloud_slot_id": task.cloud_slot_id,
+        "allocated_cloud_slot_id": task.allocated_cloud_slot_id,
         "error_detail": task.error_detail,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
@@ -58,4 +64,50 @@ def build_strategy_display_summary(display_layers: list[dict]) -> dict:
     return {
         "edge_head_count_total": sum(layer.get("edge_head_count", 0) for layer in display_layers),
         "cloud_head_count_total": sum(layer.get("cloud_head_count", 0) for layer in display_layers),
+    }
+
+
+def _iso(value):
+    return value.isoformat() if value else None
+
+
+def serialize_runtime_slot(slot) -> dict:
+    return {
+        "slot_id": slot.slot_id,
+        "role": slot.role,
+        "control_url": slot.control_url,
+        "grpc_target": getattr(slot, "grpc_target", None),
+        "process_pid": getattr(slot, "process_pid", None),
+        "spawned_by_scheduler": bool(getattr(slot, "spawned_by_scheduler", 0)),
+        "base_env_name": getattr(slot, "base_env_name", None),
+        "slot_index": getattr(slot, "slot_index", 0),
+        "process_state": slot.process_state,
+        "model_state": slot.model_state,
+        "slot_state": slot.slot_state,
+        "owner_session_id": slot.owner_session_id,
+        "owner_binding_id": slot.owner_binding_id,
+        "model_type": slot.model_type,
+        "task_id": slot.task_id,
+        "active_request_count": slot.active_request_count,
+        "integrity_status": slot.integrity_status,
+        "confirmation_status": slot.confirmation_status,
+        "last_used_at": _iso(slot.last_used_at),
+        "idle_deadline": _iso(slot.idle_deadline),
+        "process_idle_deadline": _iso(slot.process_idle_deadline),
+        "created_at": _iso(slot.created_at),
+        "updated_at": _iso(slot.updated_at),
+    }
+
+
+def serialize_runtime_binding(binding) -> dict:
+    return {
+        "binding_id": binding.binding_id,
+        "session_id": binding.session_id,
+        "task_id": binding.task_id,
+        "edge_slot_id": binding.edge_slot_id,
+        "cloud_slot_id": binding.cloud_slot_id,
+        "partition_digest": binding.partition_digest,
+        "status": binding.status,
+        "created_at": _iso(binding.created_at),
+        "updated_at": _iso(binding.updated_at),
     }

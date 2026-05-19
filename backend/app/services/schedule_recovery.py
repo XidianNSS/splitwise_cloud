@@ -2,12 +2,13 @@ import asyncio
 from datetime import datetime
 
 from app.db.database import SessionLocal
-from app.models.models import ScheduleTask
+from app.models.models import EdgeSession, ScheduleTask
 from app.services.schedule_queue import (
     LOADING_RUNNING_STATUS,
     STRATEGY_RUNNING_STATUS,
     recalculate_strategy_queue_positions,
 )
+from app.services.slot_reaper import cleanup_runtime_slots_for_session, mark_expired_sessions, release_bindings_for_session
 
 
 def recover_schedule_tasks_on_startup() -> None:
@@ -40,6 +41,16 @@ def recover_schedule_tasks_on_startup() -> None:
             db.add(task)
 
         db.commit()
+        mark_expired_sessions(db)
+        expired_sessions = db.query(EdgeSession).filter(EdgeSession.status == "expired").all()
+        for session in expired_sessions:
+            release_bindings_for_session(db, session.session_id)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(cleanup_runtime_slots_for_session(db, session.session_id))
+            else:
+                loop.create_task(cleanup_runtime_slots_for_session(db, session.session_id))
         recalculate_strategy_queue_positions(db)
     finally:
         db.close()

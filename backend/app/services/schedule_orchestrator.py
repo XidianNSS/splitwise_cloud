@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import SessionLocal
-from app.models.models import Device, EdgeSession, ScheduleTask
+from app.models.models import Device, EdgeSession, RuntimeSlot, ScheduleTask
 from app.services.algorithm_dispatcher import (
     build_algorithm_request_payload,
     derive_edge_storage_limit_gb_from_metrics,
@@ -27,10 +27,23 @@ from app.services.runtime_dispatcher import (
     dispatch_strategy_to_runtime,
     extract_ip,
 )
+from app.services.decode_server_process_manager import start_decode_server_process, start_decode_server_process_for_slot, wait_for_slot_health
 from app.services.runtime_startup_admission import check_runtime_startup_resources
 from app.services.schedule_presenter import clamp_progress
+from app.services.runtime_control_service import unload_runtime_slot
+from app.services.runtime_binding_service import create_runtime_binding, update_runtime_binding
+from app.services.runtime_slot_service import (
+    ensure_runtime_slot,
+    get_cloud_slot_by_id,
+    get_running_free_cloud_slot,
+    get_stopped_free_cloud_slot,
+    list_cloud_slots,
+    update_runtime_slot_state,
+)
+from app.services.session_lease_service import refresh_session_lease
 from app.services.schedule_queue import (
     LOADING_RUNNING_STATUS,
+    WAITING_CLOUD_SLOT_STATUS,
     STRATEGY_QUEUED_STATUS,
     STRATEGY_RUNNING_STATUS,
     count_queued_strategy_tasks,
@@ -46,6 +59,87 @@ STRATEGY_ADMISSION_LOCK = asyncio.Lock()
 logger = logging.getLogger("ScheduleOrchestrator")
 
 
+def _scheduler_confirmation_callback_url() -> str:
+    path = settings.RUNTIME_CONFIRMATION_PATH.strip() or "/api/v1/schedule/runtime/confirmation/cloud"
+    if path == "/api/v1/runtime/confirmation/cloud":
+        path = "/api/v1/schedule/runtime/confirmation/cloud"
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{settings.BACKEND_BASE_URL.rstrip('/')}" + path
+
+
+def _next_cloud_slot_index(db: Session) -> int:
+    cloud_slots = list_cloud_slots(db)
+    if not cloud_slots:
+        return 0
+    return max(slot.slot_index for slot in cloud_slots) + 1
+
+
+async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip: str) -> tuple[RuntimeSlot, bool]:
+    free_slot = get_running_free_cloud_slot(db)
+    if free_slot is not None and free_slot.owner_binding_id in {None, task.runtime_binding_id}:
+        return free_slot, False
+
+    stopped_slot = get_stopped_free_cloud_slot(db)
+    if stopped_slot is not None and stopped_slot.owner_binding_id in {None, task.runtime_binding_id}:
+        process_info = start_decode_server_process_for_slot(stopped_slot.slot_id, stopped_slot.slot_index)
+        health_ok = await wait_for_slot_health(process_info.control_url)
+        if not health_ok:
+            from app.services.decode_server_process_manager import stop_slot_process
+            stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
+            raise RuntimeError(f"cloud slot {process_info.slot_id} 重启后健康检查失败")
+
+        slot = ensure_runtime_slot(
+            db,
+            slot_id=process_info.slot_id,
+            role="cloud",
+            control_url=process_info.control_url,
+            grpc_target=process_info.grpc_target,
+            process_state="running",
+            slot_index=process_info.slot_index,
+            spawned_by_scheduler=True,
+            base_env_name=".env.wyy",
+            process_pid=process_info.process_pid,
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state="free",
+            model_state="empty",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+            process_idle_deadline=None,
+        )
+        return slot, True
+
+    slot_index = _next_cloud_slot_index(db)
+    if slot_index >= settings.CLOUD_SLOT_MAX_COUNT:
+        raise RuntimeError("没有可用的 cloud decode slot，且已达到开发环境最大 slot 数")
+
+    process_info = start_decode_server_process(slot_index)
+    health_ok = await wait_for_slot_health(process_info.control_url)
+    if not health_ok:
+        from app.services.decode_server_process_manager import stop_slot_process
+        stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
+        raise RuntimeError(f"cloud slot {process_info.slot_id} 启动后健康检查失败")
+
+    slot = ensure_runtime_slot(
+        db,
+        slot_id=process_info.slot_id,
+        role="cloud",
+        control_url=process_info.control_url,
+        grpc_target=process_info.grpc_target,
+        process_state="running",
+        slot_index=slot_index,
+        spawned_by_scheduler=True,
+        base_env_name=".env.wyy",
+        process_pid=process_info.process_pid,
+    )
+    return slot, True
+
+
 async def accept_schedule_task(
     *,
     db: Session,
@@ -55,11 +149,28 @@ async def accept_schedule_task(
 ) -> dict:
     canonical_model_type = canonicalize_model_type(requested_model_type)
 
+    existing_active_task = (
+        db.query(ScheduleTask)
+        .filter(
+            ScheduleTask.edge_session_id == edge_session.session_id,
+            ScheduleTask.status.in_(["accepted", "running"]),
+            ScheduleTask.queue_status != "done",
+        )
+        .order_by(ScheduleTask.created_at.desc(), ScheduleTask.task_id.desc())
+        .first()
+    )
+    if existing_active_task is not None:
+        return {
+            "status": "rejected",
+            "task_id": existing_active_task.task_id,
+            "phase": existing_active_task.phase,
+            "phase_progress": existing_active_task.phase_progress,
+            "overall_progress": existing_active_task.overall_progress,
+            "message": "当前会话已有未完成的调度任务，请等待其完成或关闭会话后再发起新的模型加载",
+        }
+
     edge_session.model_type = canonical_model_type
-    edge_session.updated_at = datetime.utcnow()
-    db.add(edge_session)
-    db.commit()
-    db.refresh(edge_session)
+    edge_session = refresh_session_lease(db, edge_session)
 
     task_id = str(uuid.uuid4())
     edge_device_id = edge_session.edge_device_id
@@ -70,10 +181,39 @@ async def accept_schedule_task(
         queued_strategy_count = count_queued_strategy_tasks(db)
         is_queued = running_strategy_task is not None or queued_strategy_count > 0
 
+        edge_slot = ensure_runtime_slot(
+            db,
+            slot_id=f"edge-slot-{edge_device_id}",
+            role="edge",
+            control_url=build_runtime_control_url("edge", edge_session.edge_ip or settings.EDGE_RUNTIME_REAL_HOST or "127.0.0.1"),
+        )
+        cloud_slot = ensure_runtime_slot(
+            db,
+            slot_id="cloud-slot-0",
+            role="cloud",
+            control_url=build_runtime_control_url("cloud", settings.CLOUD_RUNTIME_REAL_HOST or "127.0.0.1"),
+            grpc_target=settings.CLOUD_RUNTIME_REAL_GRPC_TARGET,
+            process_state="running",
+            slot_index=0,
+            spawned_by_scheduler=False,
+            base_env_name=".env.wyy",
+        )
+        binding = create_runtime_binding(
+            db,
+            session_id=edge_session.session_id,
+            task_id=task_id,
+            edge_slot_id=edge_slot.slot_id,
+            cloud_slot_id=cloud_slot.slot_id,
+        )
+
         task = ScheduleTask(
             task_id=task_id,
             openwebui_user_id=openwebui_user_id,
             edge_session_id=edge_session.session_id,
+            runtime_binding_id=binding.binding_id,
+            edge_slot_id=edge_slot.slot_id,
+            cloud_slot_id=cloud_slot.slot_id,
+            allocated_cloud_slot_id=cloud_slot.slot_id,
             model_type=canonical_model_type,
             status="accepted",
             phase="strategy",
@@ -136,6 +276,74 @@ async def promote_next_queued_strategy_task() -> bool:
     return True
 
 
+async def promote_waiting_loading_task() -> bool:
+    db = SessionLocal()
+    try:
+        next_task = (
+            db.query(ScheduleTask)
+            .filter(
+                ScheduleTask.queue_status == WAITING_CLOUD_SLOT_STATUS,
+                ScheduleTask.status == "accepted",
+                ScheduleTask.phase == "loading",
+            )
+            .order_by(ScheduleTask.created_at.asc(), ScheduleTask.task_id.asc())
+            .first()
+        )
+        if not next_task:
+            return False
+
+        update_task(
+            db,
+            next_task,
+            status="running",
+            queue_status=LOADING_RUNNING_STATUS,
+            queue_position=0,
+            message="cloud slot 已空闲，正在继续下发模型启动请求",
+            edge_status="dispatching",
+            cloud_status="dispatching",
+            edge_message="边端控制入口正在接收模型启动请求",
+            cloud_message="云端控制入口正在接收模型启动请求",
+        )
+        task_id = next_task.task_id
+    finally:
+        db.close()
+
+    asyncio.create_task(dispatch_loading_task(task_id))
+    logger.info("已自动推进 cloud slot 等待任务: task_id=%s", task_id)
+    return True
+
+
+async def cleanup_spawned_cloud_slot_after_dispatch_failure(db: Session, cloud_slot: RuntimeSlot) -> None:
+    from app.services.decode_server_process_manager import stop_slot_process
+
+    stop_ok = stop_slot_process(cloud_slot.slot_id, process_pid=cloud_slot.process_pid)
+    if stop_ok:
+        update_runtime_slot_state(
+            db,
+            cloud_slot,
+            slot_state="free",
+            model_state="empty",
+            process_state="stopped",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+            process_pid=None,
+            confirmation_status="none",
+            process_idle_deadline=None,
+            last_used_at=datetime.utcnow(),
+        )
+    else:
+        update_runtime_slot_state(
+            db,
+            cloud_slot,
+            slot_state="needs_reconcile",
+            model_state="failed",
+            process_state="failed",
+            last_used_at=datetime.utcnow(),
+        )
+
+
 async def dispatch_loading_task(task_id: str) -> None:
     db = SessionLocal()
     try:
@@ -167,7 +375,49 @@ async def dispatch_loading_task(task_id: str) -> None:
             await fail_task_and_promote(db, task, "设备 IP 信息缺失", "策略下发前无法解析边端或云端控制入口 IP")
             return
 
-        update_task(
+        edge_slot = ensure_runtime_slot(
+            db,
+            slot_id=task.edge_slot_id or f"edge-slot-{task.edge_device_id}",
+            role="edge",
+            control_url=build_runtime_control_url("edge", edge_ip),
+        )
+        try:
+            cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task, cloud_ip)
+        except Exception as exc:
+            await fail_task_and_promote(db, task, "云端 decode slot 分配失败", str(exc))
+            return
+
+        binding = None
+        if task.runtime_binding_id:
+            from app.models.models import RuntimeBinding
+            binding = db.query(RuntimeBinding).filter(RuntimeBinding.binding_id == task.runtime_binding_id).first()
+            if binding is not None:
+                update_runtime_binding(db, binding, cloud_slot_id=cloud_slot.slot_id)
+
+        update_runtime_slot_state(
+            db,
+            edge_slot,
+            owner_session_id=task.edge_session_id,
+            owner_binding_id=task.runtime_binding_id,
+            task_id=task.task_id,
+            model_type=task.model_type,
+            slot_state="bound",
+            model_state="loading",
+            process_state="running",
+        )
+        update_runtime_slot_state(
+            db,
+            cloud_slot,
+            owner_session_id=task.edge_session_id,
+            owner_binding_id=task.runtime_binding_id,
+            task_id=task.task_id,
+            model_type=task.model_type,
+            slot_state="bound",
+            model_state="loading",
+            process_state="running",
+            confirmation_status="pending",
+        )
+        task = update_task(
             db,
             task,
             status="running",
@@ -182,38 +432,54 @@ async def dispatch_loading_task(task_id: str) -> None:
             cloud_progress=0,
             edge_message="边端控制入口正在接收模型启动请求",
             cloud_message="云端控制入口正在接收模型启动请求",
+            cloud_slot_id=cloud_slot.slot_id,
+            allocated_cloud_slot_id=cloud_slot.slot_id,
+            spawned_cloud_slot=cloud_slot.slot_id if spawned_cloud_slot else None,
         )
 
         runtime_decision_payload = {
             "layer_partitions": decision_result["layer_partitions"],
         }
         runtime_model_name = runtime_model_type(model_type)
+        runtime_route = {
+            "cloud_slot_id": cloud_slot.slot_id,
+            "cloud_control_url": cloud_slot.control_url,
+            "cloud_decode_grpc_target": cloud_slot.grpc_target,
+            "scheduler_integrity_callback_url": _scheduler_confirmation_callback_url(),
+        }
         edge_dispatch_payload = {
             "task_id": task_id,
             "model_type": runtime_model_name,
             "decision": runtime_decision_payload,
+            "runtime_route": runtime_route,
         }
         cloud_dispatch_payload = {
             "task_id": task_id,
             "model_type": runtime_model_name,
             "decision": runtime_decision_payload,
+            "runtime_route": runtime_route,
         }
 
         logger.info(
-            "准备下发模型启动请求体: task_id=%s, runtime_payload=%s",
+            "准备下发模型启动请求体: task_id=%s, edge_payload=%s, cloud_slot=%s",
             task_id,
             json.dumps(edge_dispatch_payload, ensure_ascii=False),
-        )
-        logger.info(
-            "开始向固定控制端口下发模型启动请求: task_id=%s, edge_target=%s, cloud_target=%s",
-            task_id,
-            build_runtime_control_url("edge", edge_ip),
-            build_runtime_control_url("cloud", cloud_ip),
+            cloud_slot.slot_id,
         )
 
         results = await asyncio.gather(
-            dispatch_strategy_to_runtime(node_role="edge", device_ip=edge_ip, payload=edge_dispatch_payload),
-            dispatch_strategy_to_runtime(node_role="cloud", device_ip=cloud_ip, payload=cloud_dispatch_payload),
+            dispatch_strategy_to_runtime(
+                node_role="edge",
+                device_ip=edge_ip,
+                payload=edge_dispatch_payload,
+                control_url=edge_slot.control_url,
+            ),
+            dispatch_strategy_to_runtime(
+                node_role="cloud",
+                device_ip=cloud_ip,
+                payload=cloud_dispatch_payload,
+                control_url=cloud_slot.control_url,
+            ),
             return_exceptions=True,
         )
 
@@ -225,6 +491,8 @@ async def dispatch_loading_task(task_id: str) -> None:
             if str(result.get("status", "accepted")).strip().lower() not in {"accepted", "ok"}:
                 dispatch_errors.append(json.dumps(result, ensure_ascii=False))
         if dispatch_errors:
+            if spawned_cloud_slot:
+                await cleanup_spawned_cloud_slot_after_dispatch_failure(db, cloud_slot)
             await fail_task_and_promote(db, task, "切分策略下发失败", " | ".join(dispatch_errors))
             return
 
@@ -256,6 +524,8 @@ async def fail_task_and_promote(
         await promote_next_queued_strategy_task()
     elif previous_queue_status == STRATEGY_RUNNING_STATUS:
         await promote_next_queued_strategy_task()
+    if previous_queue_status == LOADING_RUNNING_STATUS:
+        await promote_waiting_loading_task()
 
 
 async def complete_task_and_promote(db: Session, task: ScheduleTask) -> None:
@@ -277,6 +547,8 @@ async def complete_task_and_promote(db: Session, task: ScheduleTask) -> None:
         await promote_next_queued_strategy_task()
     elif previous_queue_status == STRATEGY_RUNNING_STATUS:
         await promote_next_queued_strategy_task()
+    if previous_queue_status == LOADING_RUNNING_STATUS:
+        await promote_waiting_loading_task()
 
 
 async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_session_id: str, trigger_payload: dict) -> None:
@@ -486,6 +758,22 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
             "phase": "loading",
             "message": payload.message,
         }
+        slot_id = task.edge_slot_id if node_role == "edge" else task.cloud_slot_id
+        if slot_id:
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if slot is not None:
+                slot_fields = {
+                    "active_request_count": 0,
+                    "last_used_at": datetime.utcnow(),
+                }
+                if node_status in {"loading", "dispatching"}:
+                    slot_fields["model_state"] = "loading"
+                    slot_fields["slot_state"] = "bound"
+                elif node_status in {"ready", "completed"}:
+                    slot_fields["model_state"] = "ready"
+                    slot_fields["slot_state"] = "bound"
+                    slot_fields["integrity_status"] = "healthy"
+                update_runtime_slot_state(db, slot, **slot_fields)
         if node_role == "edge":
             update_kwargs["edge_progress"] = progress
             update_kwargs["edge_status"] = node_status
