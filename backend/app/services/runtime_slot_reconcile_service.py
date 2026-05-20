@@ -44,6 +44,14 @@ def _task_is_active(task: ScheduleTask | None) -> bool:
     return task.phase in _ACTIVE_TASK_PHASES
 
 
+def _slot_is_active_loading(slot: RuntimeSlot, task: ScheduleTask | None) -> bool:
+    if slot.slot_state != 'bound':
+        return False
+    if slot.model_state != 'loading':
+        return False
+    return _task_is_active(task)
+
+
 def _clear_slot_ownership(db: Session, slot: RuntimeSlot, *, process_state: str | None = None) -> RuntimeSlot:
     fields = {
         'slot_state': 'free',
@@ -93,6 +101,7 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
     binding_released = binding is None or binding.status in _FINISHED_BINDING_STATUSES
     session_finished = session is None or session.status in _FINISHED_SESSION_STATUSES
     task_active = _task_is_active(task)
+    slot_active_loading = _slot_is_active_loading(slot, task)
     task_finished = task is not None and task.status in _FINISHED_TASK_STATUSES
     process_alive = inspect_slot_process(slot.slot_id) is not None
     if not process_alive and slot.process_pid:
@@ -105,6 +114,15 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
             process_alive = True
 
     if not process_alive:
+        if slot_active_loading:
+            return update_runtime_slot_state(
+                db,
+                slot,
+                process_state='starting',
+                slot_state='bound',
+                model_state='loading',
+                last_used_at=datetime.utcnow(),
+            )
         if task_active:
             _mark_task_failed_if_active(db, task, f'cloud slot {slot.slot_id} 进程已丢失，任务已失败')
         if binding is not None:
@@ -123,6 +141,15 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
             health_ok = False
 
     if not health_ok:
+        if slot_active_loading:
+            return update_runtime_slot_state(
+                db,
+                slot,
+                process_state='starting',
+                slot_state='bound',
+                model_state='loading',
+                last_used_at=datetime.utcnow(),
+            )
         stopped_ok = stop_slot_process(slot.slot_id, process_pid=slot.process_pid)
         if stopped_ok:
             if task_active:
@@ -142,6 +169,15 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
     try:
         state = await fetch_runtime_state(slot)
     except Exception:
+        if slot_active_loading:
+            return update_runtime_slot_state(
+                db,
+                slot,
+                process_state='starting',
+                slot_state='bound',
+                model_state='loading',
+                last_used_at=datetime.utcnow(),
+            )
         return update_runtime_slot_state(
             db,
             slot,
@@ -156,21 +192,31 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
     draining = bool(state.get('draining'))
     runtime_model_type = state.get('model_type')
     runtime_task_id = state.get('task_id')
-    if binding_released or session_finished or (task_finished and active_request_count == 0 and not ready):
+    if binding_released or session_finished:
+        if ready and active_request_count == 0 and (runtime_model_type or runtime_task_id):
+            try:
+                await unload_runtime_slot(db, slot, reason=f'reconcile release for slot {slot.slot_id}')
+                return db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
+            except Exception:
+                return update_runtime_slot_state(
+                    db,
+                    slot,
+                    process_state='failed',
+                    slot_state='needs_reconcile',
+                    model_state='failed',
+                    last_used_at=datetime.utcnow(),
+                )
         return _clear_slot_ownership(db, slot, process_state='running')
-    if task_finished and active_request_count == 0 and ready:
-        try:
-            await unload_runtime_slot(db, slot, reason=f'reconcile release for finished task {slot.task_id or runtime_task_id or slot.slot_id}')
-            return db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
-        except Exception:
-            return update_runtime_slot_state(
-                db,
-                slot,
-                process_state='failed',
-                slot_state='needs_reconcile',
-                model_state='failed',
-                last_used_at=datetime.utcnow(),
-            )
+    if task_finished and active_request_count == 0 and not ready and not runtime_model_type and not runtime_task_id:
+        return update_runtime_slot_state(
+            db,
+            slot,
+            process_state='running',
+            slot_state='bound' if slot.owner_binding_id else 'free',
+            model_state='empty',
+            active_request_count=0,
+            last_used_at=datetime.utcnow(),
+        )
     if not ready and not runtime_model_type and active_request_count == 0 and not slot.owner_binding_id:
         return _clear_slot_ownership(db, slot, process_state='running')
     return update_runtime_slot_state(

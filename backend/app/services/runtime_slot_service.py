@@ -106,6 +106,10 @@ def get_stopped_free_cloud_slot(db: Session) -> RuntimeSlot | None:
     )
 
 
+def get_cloud_slot_zero(db: Session) -> RuntimeSlot | None:
+    return db.query(RuntimeSlot).filter(RuntimeSlot.role == "cloud", RuntimeSlot.slot_id == "cloud-slot-0").first()
+
+
 def get_active_cloud_slots(db: Session) -> list[RuntimeSlot]:
     return (
         db.query(RuntimeSlot)

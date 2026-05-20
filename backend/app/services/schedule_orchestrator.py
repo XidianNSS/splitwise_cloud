@@ -191,11 +191,9 @@ async def accept_schedule_task(
             db,
             slot_id="cloud-slot-0",
             role="cloud",
-            control_url=build_runtime_control_url("cloud", settings.CLOUD_RUNTIME_REAL_HOST or "127.0.0.1"),
-            grpc_target=settings.CLOUD_RUNTIME_REAL_GRPC_TARGET,
-            process_state="running",
+            process_state="stopped",
             slot_index=0,
-            spawned_by_scheduler=False,
+            spawned_by_scheduler=True,
             base_env_name=".env.wyy",
         )
         binding = create_runtime_binding(

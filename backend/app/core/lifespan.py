@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.db.database import Base, engine
 from app.models.models import init_db_data
+from app.services.managed_cloud_slot_bootstrap_service import bootstrap_managed_cloud_slots
 from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots
 from app.services.schedule_orchestrator import promote_next_queued_strategy_task
 from app.services.schedule_recovery import (
@@ -64,6 +65,7 @@ async def lifespan(app: FastAPI):
         db = SessionLocal()
         mark_expired_sessions(db)
         await reconcile_all_runtime_slots(db)
+        await bootstrap_managed_cloud_slots(db)
     finally:
         if db is not None:
             db.close()

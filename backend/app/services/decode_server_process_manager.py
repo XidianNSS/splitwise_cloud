@@ -63,13 +63,15 @@ def allocate_cloud_slot_ports(slot_index: int) -> tuple[int, int]:
 
 def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> DecodeSlotProcessInfo:
     http_port, grpc_port = allocate_cloud_slot_ports(slot_index)
-    control_url = f"http://127.0.0.1:{http_port}/load_strategy"
-    grpc_target = f"127.0.0.1:{grpc_port}"
+    advertised_host = settings.CLOUD_RUNTIME_REAL_HOST or "127.0.0.1"
+    control_url = f"http://{advertised_host}:{http_port}/load_strategy"
+    grpc_target = f"{advertised_host}:{grpc_port}"
 
     env = os.environ.copy()
     env.update({
         "APP_ENV": "wyy",
         "ENV_FILE": ".env.wyy",
+        "SCHEDULE_BACKEND_URL": settings.BACKEND_BASE_URL,
         "CLOUD_RUNTIME_PORT": str(http_port),
         "RUNTIME_PORT": str(http_port),
         "DECODE_GRPC_BIND": f"0.0.0.0:{grpc_port}",

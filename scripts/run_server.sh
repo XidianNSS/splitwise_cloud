@@ -14,13 +14,14 @@ if [ "${ENV_FILE_PATH#/}" = "$ENV_FILE_PATH" ]; then
     ENV_FILE_PATH="$PROJECT_ROOT/$ENV_FILE_PATH"
 fi
 
-choose_available_port() {
-    local preferred_port="$1"
-    local candidate="$preferred_port"
-    while ss -ltn | grep -q ":${candidate}\b"; do
-        candidate=$((candidate + 1))
-    done
-    echo "$candidate"
+ensure_port_available() {
+    local configured_port="$1"
+    local service_name="$2"
+    if ss -ltn | grep -q ":${configured_port}\b"; then
+        echo "🚨 错误: ${service_name} 端口 ${configured_port} 已被占用。"
+        echo "💡 当前 .env.wyy 视为固定配置，请先释放端口后再启动，脚本不会自动改写环境变量。"
+        exit 1
+    fi
 }
 
 apply_wyy_port_override_if_needed() {
@@ -32,26 +33,7 @@ apply_wyy_port_override_if_needed() {
     if [ -z "$configured_port" ]; then
         return
     fi
-    local selected_port
-    selected_port=$(choose_available_port "$configured_port")
-    if [ "$selected_port" != "$configured_port" ]; then
-        echo "⚠️ 检测到端口 $configured_port 已被占用，WYY 开发环境自动切换到端口 $selected_port"
-        python - <<PY2
-from pathlib import Path
-path = Path(r"$ENV_FILE_PATH")
-lines = path.read_text().splitlines()
-updates = {
-    "SERVER_PORT": "$selected_port",
-    "SERVER_PUBLIC_BASE_URL": "http://10.144.144.2:$selected_port",
-    "BACKEND_BASE_URL": "http://10.144.144.2:$selected_port",
-}
-for idx, line in enumerate(lines):
-    for key, value in updates.items():
-        if line.startswith(f"{key}="):
-            lines[idx] = f"{key}={value}"
-path.write_text("\n".join(lines) + "\n")
-PY2
-    fi
+    ensure_port_available "$configured_port" "backend"
 }
 
 VENV_PATH="$PROJECT_ROOT/venv/bin/activate"
