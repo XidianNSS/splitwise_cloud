@@ -775,6 +775,32 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         self.assertIn("未完成", payload["message"])
 
 
+    def test_decode_process_manager_derives_env_from_backend_env_file(self) -> None:
+        from app.services.decode_server_process_manager import start_decode_server_process_for_slot
+
+        process = MagicMock(pid=24680)
+        with (
+            patch.dict(os.environ, {"BACKEND_ENV_FILE": "/tmp/backend/.env.prod"}, clear=False),
+            patch("app.services.decode_server_process_manager.allocate_cloud_slot_ports", return_value=(9011, 51101)),
+            patch("app.services.decode_server_process_manager.subprocess.Popen", return_value=process) as popen_mock,
+        ):
+            info = start_decode_server_process_for_slot("cloud-slot-1", 1)
+
+        self.assertEqual(info.http_port, 9011)
+        self.assertEqual(info.grpc_port, 51101)
+        self.assertEqual(info.control_url, "http://127.0.0.1:9011/load_strategy")
+        self.assertEqual(info.grpc_target, "127.0.0.1:51101")
+
+        env = popen_mock.call_args.kwargs["env"]
+        self.assertEqual(env["APP_ENV"], "prod")
+        self.assertEqual(env["ENV_FILE"], ".env.prod")
+        self.assertEqual(env["BACKEND_ENV_FILE"], "/tmp/backend/.env.prod")
+        self.assertEqual(env["SCHEDULE_BACKEND_URL"], os.environ["BACKEND_BASE_URL"])
+        self.assertEqual(env["CLOUD_RUNTIME_PORT"], "9011")
+        self.assertEqual(env["RUNTIME_PORT"], "9011")
+        self.assertEqual(env["DECODE_GRPC_BIND"], "0.0.0.0:51101")
+        self.assertEqual(env["DECODE_GRPC_TARGET"], "127.0.0.1:51101")
+
     def test_allocate_cloud_slot_ports_avoids_ports_reserved_by_existing_slots(self) -> None:
         db = SessionLocal()
         try:

@@ -68,9 +68,13 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
     grpc_target = f"{advertised_host}:{grpc_port}"
 
     env = os.environ.copy()
+    backend_env_file = env.get("BACKEND_ENV_FILE", "").strip()
+    env_file_name = Path(backend_env_file).name if backend_env_file else ""
+    app_env = "prod" if env_file_name == ".env.prod" else ("wyy" if env_file_name == ".env.wyy" else env.get("APP_ENV", "prod"))
     env.update({
-        "APP_ENV": "wyy",
-        "ENV_FILE": ".env.wyy",
+        "APP_ENV": app_env,
+        "ENV_FILE": env_file_name or env.get("ENV_FILE", ".env"),
+        "BACKEND_ENV_FILE": backend_env_file,
         "SCHEDULE_BACKEND_URL": settings.BACKEND_BASE_URL,
         "CLOUD_RUNTIME_PORT": str(http_port),
         "RUNTIME_PORT": str(http_port),
