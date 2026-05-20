@@ -9,6 +9,7 @@ from app.services.schedule_queue import (
     recalculate_strategy_queue_positions,
 )
 from app.services.slot_reaper import cleanup_runtime_slots_for_session, mark_expired_sessions, release_bindings_for_session
+from app.services.startup_recovery_service import recover_runtime_ownership_on_startup
 
 
 def recover_schedule_tasks_on_startup() -> None:
@@ -42,6 +43,7 @@ def recover_schedule_tasks_on_startup() -> None:
 
         db.commit()
         mark_expired_sessions(db)
+        recover_runtime_ownership_on_startup(db)
         expired_sessions = db.query(EdgeSession).filter(EdgeSession.status == "expired").all()
         for session in expired_sessions:
             release_bindings_for_session(db, session.session_id)

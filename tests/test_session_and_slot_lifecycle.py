@@ -32,6 +32,7 @@ from app.services.slot_reaper import cleanup_runtime_slots_for_session, mark_exp
 from app.services.decode_server_process_manager import allocate_cloud_slot_ports
 from app.services.managed_cloud_slot_bootstrap_service import bootstrap_managed_cloud_slots
 from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots, reconcile_runtime_slot
+from app.services.startup_recovery_service import recover_runtime_ownership_on_startup, reconcile_runtime_ownership
 
 
 class SessionAndSlotLifecycleTest(unittest.TestCase):
@@ -497,6 +498,161 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             self.assertEqual(task.status, "running")
             self.assertEqual(task.cloud_slot_id, "cloud-slot-1")
             self.assertEqual(task.allocated_cloud_slot_id, "cloud-slot-1")
+        finally:
+            db.close()
+
+
+    def test_startup_recovery_releases_stale_loading_task_and_slot(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            task = ScheduleTask(
+                task_id="task-stale-loading",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id="binding-stale",
+                model_type="Llama-3.2-3B-Instruct",
+                status="running",
+                phase="loading",
+                queue_status="running_loading",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_status="loading",
+                cloud_status="loading",
+            )
+            db.add(task)
+            db.commit()
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-stale-loading",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task.runtime_binding_id = binding.binding_id
+            db.add(task)
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, edge_slot, slot_state="bound", model_state="loading", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-stale-loading")
+            update_runtime_slot_state(db, cloud_slot, slot_state="bound", model_state="loading", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-stale-loading")
+            recover_runtime_ownership_on_startup(db)
+            db.refresh(task)
+            db.refresh(binding)
+            db.refresh(edge_slot)
+            db.refresh(cloud_slot)
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(binding.status, "released")
+            self.assertIsNone(edge_slot.owner_binding_id)
+            self.assertIsNone(cloud_slot.owner_binding_id)
+        finally:
+            db.close()
+
+    def test_startup_recovery_fails_untrustworthy_completed_task(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            task = ScheduleTask(
+                task_id="task-bad-completed",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id="binding-completed",
+                model_type="Llama-3.2-3B-Instruct",
+                status="completed",
+                phase="completed",
+                queue_status="done",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_status="ready",
+                cloud_status="ready",
+            )
+            db.add(task)
+            db.commit()
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-bad-completed",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task.runtime_binding_id = binding.binding_id
+            db.add(task)
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, edge_slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-bad-completed")
+            update_runtime_slot_state(db, cloud_slot, slot_state="bound", model_state="ready", confirmation_status="failed", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-bad-completed")
+            recover_runtime_ownership_on_startup(db)
+            db.refresh(task)
+            db.refresh(binding)
+            self.assertEqual(task.status, "failed")
+            self.assertEqual(binding.status, "released")
+        finally:
+            db.close()
+
+    def test_reconcile_runtime_ownership_clears_released_binding_owner(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-released-binding",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            update_runtime_binding(db, binding, status="released")
+            slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-released-binding")
+            reconcile_runtime_ownership(db)
+            db.refresh(slot)
+            self.assertEqual(slot.slot_state, "free")
+            self.assertIsNone(slot.owner_binding_id)
+        finally:
+            db.close()
+
+    def test_startup_recovery_preserves_trustworthy_completed_binding(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            task = ScheduleTask(
+                task_id="task-good-completed",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id="binding-good",
+                model_type="Llama-3.2-3B-Instruct",
+                status="completed",
+                phase="completed",
+                queue_status="done",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_status="ready",
+                cloud_status="ready",
+            )
+            db.add(task)
+            db.commit()
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-good-completed",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task.runtime_binding_id = binding.binding_id
+            db.add(task)
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, edge_slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-good-completed")
+            update_runtime_slot_state(db, cloud_slot, slot_state="bound", model_state="ready", confirmation_status="passed", owner_session_id="session-1", owner_binding_id=binding.binding_id, task_id="task-good-completed")
+            recover_runtime_ownership_on_startup(db)
+            db.refresh(task)
+            db.refresh(binding)
+            self.assertEqual(task.status, "completed")
+            self.assertEqual(binding.status, "binding")
         finally:
             db.close()
 

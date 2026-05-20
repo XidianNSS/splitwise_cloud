@@ -206,7 +206,7 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
                     model_state='failed',
                     last_used_at=datetime.utcnow(),
                 )
-        return _clear_slot_ownership(db, slot, process_state='running')
+        return _clear_slot_ownership(db, slot, process_state='stopped')
     if task_finished and active_request_count == 0 and not ready and not runtime_model_type and not runtime_task_id:
         return update_runtime_slot_state(
             db,

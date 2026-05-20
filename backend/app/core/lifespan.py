@@ -9,6 +9,7 @@ from app.db.database import Base, engine
 from app.models.models import init_db_data
 from app.services.managed_cloud_slot_bootstrap_service import bootstrap_managed_cloud_slots
 from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots
+from app.services.startup_recovery_service import reconcile_runtime_ownership
 from app.services.schedule_orchestrator import promote_next_queued_strategy_task
 from app.services.schedule_recovery import (
     bootstrap_schedule_queues_on_startup,
@@ -46,6 +47,7 @@ async def _slot_process_reaper_loop() -> None:
             db = SessionLocal()
             mark_expired_sessions(db)
             stop_idle_spawned_cloud_slots(db)
+            reconcile_runtime_ownership(db)
             await reconcile_all_runtime_slots(db)
         finally:
             if db is not None:
