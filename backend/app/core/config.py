@@ -72,6 +72,10 @@ class Settings:
     NETWORK_DEFAULT_PACKET_LOSS: float = float(os.getenv("NETWORK_DEFAULT_PACKET_LOSS", 0.0))
     PROMETHEUS_QUERY_TIMEOUT: float = float(os.getenv("PROMETHEUS_QUERY_TIMEOUT", 3.0))
     PROMETHEUS_CACHE_SECONDS: float = float(os.getenv("PROMETHEUS_CACHE_SECONDS", 15.0))
+    ASCEND_IPS: frozenset[str] = frozenset(
+        ip.strip() for ip in os.getenv("ASCEND_IPS", "").split(",") if ip.strip()
+    )
+    ASCEND_NPU_EXPORTER_PORT: int = int(os.getenv("ASCEND_NPU_EXPORTER_PORT", 9500))
     NETWORK_PROBE_CACHE_SECONDS: float = float(os.getenv("NETWORK_PROBE_CACHE_SECONDS", 30.0))
     NETWORK_MAX_CONCURRENT_PROBES: int = int(os.getenv("NETWORK_MAX_CONCURRENT_PROBES", 5))
     FRONTEND_DIR: Path = PROJECT_ROOT / "frontend"
