@@ -213,8 +213,11 @@ function switchGrafanaDevice() {
     const val = document.getElementById("custom-device-selector").value;
     if (!val) return;
     const ip = val.split(":")[0];
-    document.getElementById("grafana-frame").src = `http://10.144.144.2:3000/d/ad9hqhg/b9a97b3?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(ip)}`;
+    const isAscend = val.includes(":9500");
+    const dashboardId = isAscend ? "addfqnr/e0d73c7" : "ad9hqhg/b9a97b3";
+    document.getElementById("grafana-frame").src = `http://10.144.144.2:3000/d/${dashboardId}?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(ip)}`;
 }
+//新增判断是否是昇腾，若是昇腾，则展示grafana中昇腾专属dashborad，若不是，则展示用户监控大屏dashboard
 
 function switchView(viewId, navElement) {
     document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
