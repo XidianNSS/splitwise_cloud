@@ -59,6 +59,7 @@ class Settings:
     CLOUD_SLOT_GRPC_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_GRPC_BASE_PORT", "52163"))
     CLOUD_SLOT_MAX_COUNT: int = int(os.getenv("CLOUD_SLOT_MAX_COUNT", "4"))
     CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS: int = int(os.getenv("CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS", "30"))
+    RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS: float = float(os.getenv("RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS", "5"))
     RUNTIME_CONFIRMATION_PATH: str = os.getenv("RUNTIME_CONFIRMATION_PATH", "/api/v1/runtime/confirmation/cloud")
 
     PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.2:9090")
@@ -79,6 +80,10 @@ class Settings:
     NETWORK_DEFAULT_PACKET_LOSS: float = float(os.getenv("NETWORK_DEFAULT_PACKET_LOSS", 0.0))
     PROMETHEUS_QUERY_TIMEOUT: float = float(os.getenv("PROMETHEUS_QUERY_TIMEOUT", 3.0))
     PROMETHEUS_CACHE_SECONDS: float = float(os.getenv("PROMETHEUS_CACHE_SECONDS", 15.0))
+    ASCEND_IPS: frozenset[str] = frozenset(
+        ip.strip() for ip in os.getenv("ASCEND_IPS", "").split(",") if ip.strip()
+    )
+    ASCEND_NPU_EXPORTER_PORT: int = int(os.getenv("ASCEND_NPU_EXPORTER_PORT", 9500))
     NETWORK_PROBE_CACHE_SECONDS: float = float(os.getenv("NETWORK_PROBE_CACHE_SECONDS", 30.0))
     NETWORK_MAX_CONCURRENT_PROBES: int = int(os.getenv("NETWORK_MAX_CONCURRENT_PROBES", 5))
     FRONTEND_DIR: Path = PROJECT_ROOT / "frontend"

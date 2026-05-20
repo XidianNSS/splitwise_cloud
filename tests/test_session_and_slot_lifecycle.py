@@ -30,6 +30,7 @@ from app.services.runtime_slot_service import ensure_runtime_slot, update_runtim
 from app.services.schedule_orchestrator import dispatch_loading_task, promote_waiting_loading_task
 from app.services.slot_reaper import cleanup_runtime_slots_for_session, mark_expired_sessions, release_bindings_for_session, stop_idle_spawned_cloud_slots
 from app.services.decode_server_process_manager import allocate_cloud_slot_ports
+from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots, reconcile_runtime_slot
 
 
 class SessionAndSlotLifecycleTest(unittest.TestCase):
@@ -958,6 +959,327 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             self.assertEqual(cloud_slot.confirmation_status, "passed")
         finally:
             db.close()
+
+def test_reconcile_dead_spawned_slot_releases_to_free_stopped(self) -> None:
+    self._create_session(status='closed')
+    db = SessionLocal()
+    try:
+        task = ScheduleTask(
+            task_id='task-dead',
+            openwebui_user_id='user-1',
+            edge_session_id='session-1',
+            runtime_binding_id='binding-dead',
+            model_type='Llama-3.2-3B-Instruct',
+            status='completed',
+            phase='completed',
+            phase_progress=100,
+            overall_progress=100,
+            message='done',
+            edge_device_id='edge_A',
+            cloud_device_id='cloud',
+            edge_progress=100,
+            cloud_progress=100,
+            edge_status='ready',
+            cloud_status='ready',
+            queue_status='done',
+            queue_position=0,
+            edge_slot_id='edge-slot-edge_A',
+            cloud_slot_id='cloud-slot-1',
+            allocated_cloud_slot_id='cloud-slot-1',
+            edge_message='done',
+            cloud_message='done',
+            strategy_payload='{"layer_partitions": []}',
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(task)
+        db.commit()
+        binding = create_runtime_binding(
+            db,
+            session_id='session-1',
+            task_id='task-dead',
+            edge_slot_id='edge-slot-edge_A',
+            cloud_slot_id='cloud-slot-1',
+        )
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='cloud-slot-1',
+            role='cloud',
+            control_url='http://127.0.0.1:19117/load_strategy',
+            grpc_target='127.0.0.1:52167',
+            slot_index=1,
+            spawned_by_scheduler=True,
+            process_state='running',
+            process_pid=999999,
+            base_env_name='.env.wyy',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='bound',
+            model_state='ready',
+            owner_session_id='session-1',
+            owner_binding_id=binding.binding_id,
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-dead',
+        )
+        import asyncio
+        asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-1').first()
+        binding = db.query(RuntimeBinding).filter(RuntimeBinding.binding_id == binding.binding_id).first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, 'stopped')
+        self.assertEqual(slot.slot_state, 'free')
+        self.assertEqual(slot.model_state, 'empty')
+        self.assertIsNone(slot.owner_binding_id)
+        self.assertIsNone(slot.process_pid)
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.status, 'released')
+    finally:
+        db.close()
+
+def test_reconcile_needs_reconcile_spawned_slot_returns_to_free_stopped(self) -> None:
+    db = SessionLocal()
+    try:
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='cloud-slot-2',
+            role='cloud',
+            control_url='http://127.0.0.1:19118/load_strategy',
+            grpc_target='127.0.0.1:52168',
+            slot_index=2,
+            spawned_by_scheduler=True,
+            process_state='failed',
+            process_pid=999998,
+            base_env_name='.env.wyy',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='needs_reconcile',
+            model_state='failed',
+            owner_session_id='session-ghost',
+            owner_binding_id='binding-ghost',
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-ghost',
+        )
+        import asyncio
+        asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-2').first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, 'stopped')
+        self.assertEqual(slot.slot_state, 'free')
+        self.assertEqual(slot.model_state, 'empty')
+        self.assertIsNone(slot.owner_session_id)
+        self.assertIsNone(slot.owner_binding_id)
+    finally:
+        db.close()
+
+def test_reconcile_healthy_slot_keeps_bound_ready_running(self) -> None:
+    self._create_session()
+    db = SessionLocal()
+    try:
+        binding = create_runtime_binding(
+            db,
+            session_id='session-1',
+            task_id='task-live',
+            edge_slot_id='edge-slot-edge_A',
+            cloud_slot_id='cloud-slot-0',
+        )
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='cloud-slot-0',
+            role='cloud',
+            control_url='http://127.0.0.1:19114/load_strategy',
+            grpc_target='127.0.0.1:52164',
+            slot_index=0,
+            spawned_by_scheduler=False,
+            process_state='running',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='bound',
+            model_state='failed',
+            owner_session_id='session-1',
+            owner_binding_id=binding.binding_id,
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-live',
+            confirmation_status='none',
+            integrity_status='unknown',
+        )
+        with patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(return_value={
+            'ready': True,
+            'draining': False,
+            'active_request_count': 0,
+            'model_type': 'Llama-3.2-3B-Instruct',
+            'task_id': 'task-live',
+        })):
+            import asyncio
+            asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-0').first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, 'running')
+        self.assertEqual(slot.slot_state, 'bound')
+        self.assertEqual(slot.model_state, 'ready')
+        self.assertEqual(slot.integrity_status, 'healthy')
+        self.assertEqual(slot.confirmation_status, 'passed')
+    finally:
+        db.close()
+
+def test_reconcile_base_or_edge_unreachable_marks_needs_reconcile(self) -> None:
+    self._create_session()
+    db = SessionLocal()
+    try:
+        binding = create_runtime_binding(
+            db,
+            session_id='session-1',
+            task_id='task-edge',
+            edge_slot_id='edge-slot-edge_A',
+            cloud_slot_id='cloud-slot-0',
+        )
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='edge-slot-edge_A',
+            role='edge',
+            control_url='http://127.0.0.1:19112/load_strategy',
+            process_state='running',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='bound',
+            model_state='ready',
+            owner_session_id='session-1',
+            owner_binding_id=binding.binding_id,
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-edge',
+        )
+        with patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(side_effect=RuntimeError('down'))):
+            import asyncio
+            asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'edge-slot-edge_A').first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, 'failed')
+        self.assertEqual(slot.slot_state, 'needs_reconcile')
+        self.assertEqual(slot.model_state, 'failed')
+    finally:
+        db.close()
+
+def test_reconcile_released_binding_clears_slot_owner(self) -> None:
+    self._create_session()
+    db = SessionLocal()
+    try:
+        binding = create_runtime_binding(
+            db,
+            session_id='session-1',
+            task_id='task-release',
+            edge_slot_id='edge-slot-edge_A',
+            cloud_slot_id='cloud-slot-0',
+        )
+        update_runtime_binding(db, binding, status='released')
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='cloud-slot-0',
+            role='cloud',
+            control_url='http://127.0.0.1:19114/load_strategy',
+            grpc_target='127.0.0.1:52164',
+            slot_index=0,
+            process_state='running',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='bound',
+            model_state='empty',
+            owner_session_id='session-1',
+            owner_binding_id=binding.binding_id,
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-release',
+        )
+        with patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(return_value={
+            'ready': False,
+            'draining': False,
+            'active_request_count': 0,
+            'model_type': None,
+            'task_id': None,
+        })):
+            import asyncio
+            asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-0').first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.slot_state, 'free')
+        self.assertEqual(slot.model_state, 'empty')
+        self.assertIsNone(slot.owner_binding_id)
+        self.assertIsNone(slot.owner_session_id)
+    finally:
+        db.close()
+
+def test_reconcile_all_runtime_slots_processes_multiple_slots(self) -> None:
+    db = SessionLocal()
+    try:
+        ensure_runtime_slot(
+            db,
+            slot_id='cloud-slot-1',
+            role='cloud',
+            control_url='http://127.0.0.1:19117/load_strategy',
+            grpc_target='127.0.0.1:52167',
+            slot_index=1,
+            spawned_by_scheduler=True,
+            process_state='failed',
+            process_pid=999997,
+            base_env_name='.env.wyy',
+        )
+        ensure_runtime_slot(
+            db,
+            slot_id='edge-slot-edge_A',
+            role='edge',
+            control_url='http://127.0.0.1:19112/load_strategy',
+            process_state='running',
+        )
+        slot_cloud = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-1').first()
+        slot_edge = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'edge-slot-edge_A').first()
+        update_runtime_slot_state(db, slot_cloud, slot_state='needs_reconcile', model_state='failed')
+        update_runtime_slot_state(db, slot_edge, slot_state='free', model_state='empty')
+        with patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(return_value={
+            'ready': False,
+            'draining': False,
+            'active_request_count': 0,
+            'model_type': None,
+            'task_id': None,
+        })):
+            import asyncio
+            slot_ids = asyncio.run(reconcile_all_runtime_slots(db))
+        self.assertIn('cloud-slot-1', slot_ids)
+        self.assertIn('edge-slot-edge_A', slot_ids)
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

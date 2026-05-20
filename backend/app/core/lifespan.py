@@ -4,8 +4,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.core.config import settings
 from app.db.database import Base, engine
 from app.models.models import init_db_data
+from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots
 from app.services.schedule_orchestrator import promote_next_queued_strategy_task
 from app.services.schedule_recovery import (
     bootstrap_schedule_queues_on_startup,
@@ -37,11 +39,13 @@ logger = logging.getLogger("AppLifespan")
 async def _slot_process_reaper_loop() -> None:
     from app.db.database import SessionLocal
     while True:
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(settings.RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS)
         db = None
         try:
             db = SessionLocal()
+            mark_expired_sessions(db)
             stop_idle_spawned_cloud_slots(db)
+            await reconcile_all_runtime_slots(db)
         finally:
             if db is not None:
                 db.close()
@@ -59,6 +63,7 @@ async def lifespan(app: FastAPI):
         from app.db.database import SessionLocal
         db = SessionLocal()
         mark_expired_sessions(db)
+        await reconcile_all_runtime_slots(db)
     finally:
         if db is not None:
             db.close()

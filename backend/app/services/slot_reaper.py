@@ -60,6 +60,7 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
             update_runtime_slot_state(
                 db,
                 slot,
+                process_state="failed",
                 slot_state="needs_reconcile",
                 model_state="failed",
                 last_used_at=datetime.utcnow(),
