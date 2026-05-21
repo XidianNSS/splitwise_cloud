@@ -27,7 +27,7 @@ from app.services.runtime_dispatcher import (
     dispatch_strategy_to_runtime,
     extract_ip,
 )
-from app.services.decode_server_process_manager import start_decode_server_process, start_decode_server_process_for_slot, wait_for_slot_health
+from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process, start_decode_server_process_for_slot, wait_for_slot_health
 from app.services.runtime_startup_admission import check_runtime_startup_resources
 from app.services.schedule_presenter import clamp_progress
 from app.services.runtime_control_service import unload_runtime_slot
@@ -57,6 +57,7 @@ TASK_TERMINAL_STATUSES = {"completed", "failed"}
 STRATEGY_ADMISSION_LOCK = asyncio.Lock()
 
 logger = logging.getLogger("ScheduleOrchestrator")
+RUNTIME_APP_ENV, RUNTIME_ENV_FILE = current_runtime_env_metadata()
 
 
 def _scheduler_confirmation_callback_url() -> str:
@@ -98,7 +99,7 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
             process_state="running",
             slot_index=process_info.slot_index,
             spawned_by_scheduler=True,
-            base_env_name=".env.wyy",
+            base_env_name=RUNTIME_ENV_FILE,
             process_pid=process_info.process_pid,
         )
         update_runtime_slot_state(
@@ -134,7 +135,7 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
         process_state="running",
         slot_index=slot_index,
         spawned_by_scheduler=True,
-        base_env_name=".env.wyy",
+        base_env_name=RUNTIME_ENV_FILE,
         process_pid=process_info.process_pid,
     )
     return slot, True
@@ -194,7 +195,7 @@ async def accept_schedule_task(
             process_state="stopped",
             slot_index=0,
             spawned_by_scheduler=True,
-            base_env_name=".env.wyy",
+            base_env_name=RUNTIME_ENV_FILE,
         )
         binding = create_runtime_binding(
             db,

@@ -61,6 +61,14 @@ def allocate_cloud_slot_ports(slot_index: int) -> tuple[int, int]:
     return http_port, grpc_port
 
 
+def current_runtime_env_metadata() -> tuple[str, str]:
+    env = os.environ.copy()
+    backend_env_file = env.get("BACKEND_ENV_FILE", "").strip()
+    env_file_name = Path(backend_env_file).name if backend_env_file else ""
+    app_env = "prod" if env_file_name == ".env.prod" else ("wyy" if env_file_name == ".env.wyy" else env.get("APP_ENV", "prod"))
+    return app_env, env_file_name or env.get("ENV_FILE", ".env")
+
+
 def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> DecodeSlotProcessInfo:
     http_port, grpc_port = allocate_cloud_slot_ports(slot_index)
     advertised_host = settings.CLOUD_RUNTIME_REAL_HOST or "127.0.0.1"
@@ -69,11 +77,10 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
 
     env = os.environ.copy()
     backend_env_file = env.get("BACKEND_ENV_FILE", "").strip()
-    env_file_name = Path(backend_env_file).name if backend_env_file else ""
-    app_env = "prod" if env_file_name == ".env.prod" else ("wyy" if env_file_name == ".env.wyy" else env.get("APP_ENV", "prod"))
+    app_env, env_file_name = current_runtime_env_metadata()
     env.update({
         "APP_ENV": app_env,
-        "ENV_FILE": env_file_name or env.get("ENV_FILE", ".env"),
+        "ENV_FILE": env_file_name,
         "BACKEND_ENV_FILE": backend_env_file,
         "SCHEDULE_BACKEND_URL": settings.BACKEND_BASE_URL,
         "CLOUD_RUNTIME_PORT": str(http_port),

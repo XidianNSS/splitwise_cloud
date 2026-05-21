@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from sqlalchemy.orm import Session
 
-from app.services.decode_server_process_manager import start_decode_server_process_for_slot, wait_for_slot_health
+from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process_for_slot, wait_for_slot_health
 from app.services.runtime_slot_service import ensure_runtime_slot, update_runtime_slot_state
 
 
 async def bootstrap_managed_cloud_slots(db: Session) -> None:
+    _, env_file_name = current_runtime_env_metadata()
+
     slot = ensure_runtime_slot(
         db,
         slot_id="cloud-slot-0",
@@ -14,7 +16,7 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         process_state="stopped",
         slot_index=0,
         spawned_by_scheduler=True,
-        base_env_name=".env.wyy",
+        base_env_name=env_file_name,
     )
 
     if slot.process_state == "running" and slot.control_url:
@@ -38,7 +40,7 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         process_state="running",
         slot_index=0,
         spawned_by_scheduler=True,
-        base_env_name=".env.wyy",
+        base_env_name=env_file_name,
         process_pid=process_info.process_pid,
     )
     update_runtime_slot_state(
