@@ -28,11 +28,23 @@ def ensure_phase2_schema() -> None:
         "base_env_name": "ALTER TABLE runtime_slots ADD COLUMN base_env_name VARCHAR",
         "slot_index": "ALTER TABLE runtime_slots ADD COLUMN slot_index INTEGER DEFAULT 0",
     }
+    expected_task_columns = {
+        "edge_strategy_progress": "ALTER TABLE schedule_tasks ADD COLUMN edge_strategy_progress INTEGER DEFAULT 0",
+        "edge_integrity_progress": "ALTER TABLE schedule_tasks ADD COLUMN edge_integrity_progress INTEGER DEFAULT 0",
+        "edge_runtime_load_progress": "ALTER TABLE schedule_tasks ADD COLUMN edge_runtime_load_progress INTEGER DEFAULT 0",
+        "cloud_strategy_progress": "ALTER TABLE schedule_tasks ADD COLUMN cloud_strategy_progress INTEGER DEFAULT 0",
+        "cloud_integrity_progress": "ALTER TABLE schedule_tasks ADD COLUMN cloud_integrity_progress INTEGER DEFAULT 0",
+        "cloud_runtime_load_progress": "ALTER TABLE schedule_tasks ADD COLUMN cloud_runtime_load_progress INTEGER DEFAULT 0",
+    }
 
     with engine.begin() as conn:
         existing = {row[1] for row in conn.execute(text("PRAGMA table_info(runtime_slots)"))}
         for column_name, ddl in expected_columns.items():
             if column_name not in existing:
+                conn.execute(text(ddl))
+        existing_task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(schedule_tasks)"))}
+        for column_name, ddl in expected_task_columns.items():
+            if column_name not in existing_task_columns:
                 conn.execute(text(ddl))
 
 logger = logging.getLogger("AppLifespan")

@@ -656,6 +656,115 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_runtime_progress_updates_three_stage_fields(self) -> None:
+        db = SessionLocal()
+        try:
+            task = ScheduleTask(
+                task_id="task-progress-stages",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                model_type="Llama-3.2-3B-Instruct",
+                status="running",
+                phase="loading",
+                phase_progress=0,
+                overall_progress=0,
+                message="loading",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_status="loading",
+                cloud_status="loading",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        import asyncio
+        from types import SimpleNamespace
+        from app.services.schedule_orchestrator import handle_runtime_progress
+
+        asyncio.run(handle_runtime_progress(SimpleNamespace(
+            task_id="task-progress-stages",
+            status="loading",
+            progress=60,
+            message="runtime load progressing",
+            stage="runtime_load",
+            node_role="edge",
+        )))
+        asyncio.run(handle_runtime_progress(SimpleNamespace(
+            task_id="task-progress-stages",
+            status="loading",
+            progress=50,
+            message="integrity progressing",
+            stage="integrity",
+            node_role="cloud",
+        )))
+
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-progress-stages").first()
+            self.assertIsNotNone(task)
+            self.assertEqual(task.edge_runtime_load_progress, 60)
+            self.assertEqual(task.cloud_integrity_progress, 50)
+            self.assertEqual(task.edge_progress, 18)
+            self.assertEqual(task.cloud_progress, 15)
+        finally:
+            db.close()
+
+    def test_schedule_status_response_includes_stage_progress_fields(self) -> None:
+        db = SessionLocal()
+        try:
+            task = ScheduleTask(
+                task_id="task-stage-response",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                model_type="Llama-3.2-3B-Instruct",
+                status="running",
+                phase="loading",
+                phase_progress=50,
+                overall_progress=75,
+                message="stage fields",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=88,
+                cloud_progress=77,
+                edge_strategy_progress=100,
+                edge_integrity_progress=80,
+                edge_runtime_load_progress=60,
+                cloud_strategy_progress=100,
+                cloud_integrity_progress=70,
+                cloud_runtime_load_progress=40,
+                edge_status="loading",
+                cloud_status="loading",
+                edge_message="edge",
+                cloud_message="cloud",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/v1/schedule/tasks/task-stage-response",
+            headers={"Authorization": "Bearer dev-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["edge_strategy_progress"], 100)
+        self.assertEqual(payload["edge_integrity_progress"], 80)
+        self.assertEqual(payload["edge_runtime_load_progress"], 60)
+        self.assertEqual(payload["cloud_strategy_progress"], 100)
+        self.assertEqual(payload["cloud_integrity_progress"], 70)
+        self.assertEqual(payload["cloud_runtime_load_progress"], 40)
+
     def test_schedule_runtime_observability_endpoints(self) -> None:
         self._create_session()
         db = SessionLocal()

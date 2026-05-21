@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models.models import ScheduleTask
-from app.services.schedule_presenter import calc_overall_progress, clamp_progress
+from app.services.schedule_presenter import calc_overall_progress, calc_weighted_stage_progress, clamp_progress
 
 
 def update_task(
@@ -16,6 +16,12 @@ def update_task(
     message: str | None = None,
     edge_progress: int | None = None,
     cloud_progress: int | None = None,
+    edge_strategy_progress: int | None = None,
+    edge_integrity_progress: int | None = None,
+    edge_runtime_load_progress: int | None = None,
+    cloud_strategy_progress: int | None = None,
+    cloud_integrity_progress: int | None = None,
+    cloud_runtime_load_progress: int | None = None,
     edge_status: str | None = None,
     cloud_status: str | None = None,
     edge_message: str | None = None,
@@ -43,6 +49,18 @@ def update_task(
         task.edge_progress = clamp_progress(edge_progress)
     if cloud_progress is not None:
         task.cloud_progress = clamp_progress(cloud_progress)
+    if edge_strategy_progress is not None:
+        task.edge_strategy_progress = clamp_progress(edge_strategy_progress)
+    if edge_integrity_progress is not None:
+        task.edge_integrity_progress = clamp_progress(edge_integrity_progress)
+    if edge_runtime_load_progress is not None:
+        task.edge_runtime_load_progress = clamp_progress(edge_runtime_load_progress)
+    if cloud_strategy_progress is not None:
+        task.cloud_strategy_progress = clamp_progress(cloud_strategy_progress)
+    if cloud_integrity_progress is not None:
+        task.cloud_integrity_progress = clamp_progress(cloud_integrity_progress)
+    if cloud_runtime_load_progress is not None:
+        task.cloud_runtime_load_progress = clamp_progress(cloud_runtime_load_progress)
     if edge_status is not None:
         task.edge_status = edge_status
     if cloud_status is not None:
@@ -81,12 +99,31 @@ def update_task(
     elif task.phase == "loading":
         task.phase_progress = clamp_progress((task.edge_progress + task.cloud_progress) // 2)
 
+    task.edge_progress = calc_weighted_stage_progress(
+        task.edge_strategy_progress,
+        task.edge_integrity_progress,
+        task.edge_runtime_load_progress,
+    )
+    task.cloud_progress = calc_weighted_stage_progress(
+        task.cloud_strategy_progress,
+        task.cloud_integrity_progress,
+        task.cloud_runtime_load_progress,
+    )
+
     if task.status == "completed":
         task.queue_status = "done"
         task.queue_position = 0
         task.phase = "completed"
         task.phase_progress = 100
         task.overall_progress = 100
+        task.edge_progress = 100
+        task.cloud_progress = 100
+        task.edge_strategy_progress = 100
+        task.edge_integrity_progress = 100
+        task.edge_runtime_load_progress = 100
+        task.cloud_strategy_progress = 100
+        task.cloud_integrity_progress = 100
+        task.cloud_runtime_load_progress = 100
     elif task.status == "failed":
         task.queue_status = "done"
         task.queue_position = 0

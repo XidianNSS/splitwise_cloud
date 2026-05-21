@@ -16,6 +16,18 @@ def calc_overall_progress(phase: str, phase_progress: int) -> int:
     return phase_progress
 
 
+def calc_weighted_stage_progress(
+    strategy_progress: int,
+    integrity_progress: int,
+    runtime_load_progress: int,
+) -> int:
+    return round(
+        clamp_progress(strategy_progress) * 0.4
+        + clamp_progress(integrity_progress) * 0.3
+        + clamp_progress(runtime_load_progress) * 0.3
+    )
+
+
 def serialize_task(task: ScheduleTask) -> dict:
     return {
         "task_id": task.task_id,
@@ -26,6 +38,12 @@ def serialize_task(task: ScheduleTask) -> dict:
         "message": task.message,
         "edge_progress": task.edge_progress,
         "cloud_progress": task.cloud_progress,
+        "edge_strategy_progress": task.edge_strategy_progress,
+        "edge_integrity_progress": task.edge_integrity_progress,
+        "edge_runtime_load_progress": task.edge_runtime_load_progress,
+        "cloud_strategy_progress": task.cloud_strategy_progress,
+        "cloud_integrity_progress": task.cloud_integrity_progress,
+        "cloud_runtime_load_progress": task.cloud_runtime_load_progress,
         "edge_status": task.edge_status,
         "cloud_status": task.cloud_status,
         "edge_message": task.edge_message,

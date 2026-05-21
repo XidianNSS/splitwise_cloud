@@ -71,6 +71,7 @@ class RuntimeProgressCallbackRequest(BaseModel):
     status: str
     progress: int
     message: str
+    stage: Optional[str] = None
     node_role: Optional[str] = None
 
 
@@ -92,6 +93,12 @@ class ScheduleTaskStatusResponse(BaseModel):
     message: str
     edge_progress: int
     cloud_progress: int
+    edge_strategy_progress: int
+    edge_integrity_progress: int
+    edge_runtime_load_progress: int
+    cloud_strategy_progress: int
+    cloud_integrity_progress: int
+    cloud_runtime_load_progress: int
     edge_status: str
     cloud_status: str
     edge_message: str

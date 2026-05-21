@@ -301,6 +301,8 @@ async def promote_waiting_loading_task() -> bool:
             cloud_status="dispatching",
             edge_message="边端控制入口正在接收模型启动请求",
             cloud_message="云端控制入口正在接收模型启动请求",
+            edge_strategy_progress=100,
+            cloud_strategy_progress=100,
         )
         task_id = next_task.task_id
     finally:
@@ -426,8 +428,12 @@ async def dispatch_loading_task(task_id: str) -> None:
             queue_position=0,
             edge_status="dispatching",
             cloud_status="dispatching",
-            edge_progress=0,
-            cloud_progress=0,
+            edge_strategy_progress=100,
+            cloud_strategy_progress=100,
+            edge_integrity_progress=0,
+            cloud_integrity_progress=0,
+            edge_runtime_load_progress=0,
+            cloud_runtime_load_progress=0,
             edge_message="边端控制入口正在接收模型启动请求",
             cloud_message="云端控制入口正在接收模型启动请求",
             cloud_slot_id=cloud_slot.slot_id,
@@ -502,6 +508,8 @@ async def dispatch_loading_task(task_id: str) -> None:
             message="模型启动请求已受理，等待边云推理节点完成模型加载",
             edge_status="loading",
             cloud_status="loading",
+            edge_strategy_progress=100,
+            cloud_strategy_progress=100,
             edge_message="等待边端开始加载模型",
             cloud_message="等待云端开始加载模型",
         )
@@ -574,6 +582,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             queue_status=STRATEGY_RUNNING_STATUS,
             queue_position=0,
             dispatched_at=datetime.utcnow(),
+            edge_strategy_progress=5,
+            cloud_strategy_progress=5,
             edge_message="等待切分策略计算完成",
             cloud_message="等待切分策略计算完成",
         )
@@ -612,6 +622,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             task,
             phase_progress=15,
             message="用户授权校验完成，正在采集边云环境指标",
+            edge_strategy_progress=15,
+            cloud_strategy_progress=15,
             edge_device_id=edge_device_id,
             cloud_device_id=cloud_device_id,
         )
@@ -661,6 +673,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             task,
             phase_progress=25,
             message="环境指标采集完成，正在进行模型启动资源预检查",
+            edge_strategy_progress=30,
+            cloud_strategy_progress=30,
         )
 
         resource_failures = check_runtime_startup_resources(
@@ -682,6 +696,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             task,
             phase_progress=40,
             message="资源预检查通过，正在组装策略输入 JSON",
+            edge_strategy_progress=30,
+            cloud_strategy_progress=30,
         )
 
         update_task(
@@ -689,6 +705,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             task,
             phase_progress=60,
             message="策略输入 JSON 已生成，正在请求切分策略模型",
+            edge_strategy_progress=60,
+            cloud_strategy_progress=60,
         )
         decision_result = await request_algorithm_decision(task_id, model_type, raw_input_json)
 
@@ -701,6 +719,8 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             message="切分策略计算完成，准备下发模型启动请求",
             queue_status=LOADING_RUNNING_STATUS,
             queue_position=0,
+            edge_strategy_progress=100,
+            cloud_strategy_progress=100,
         )
         await promote_next_queued_strategy_task()
         await dispatch_loading_task(task_id)
@@ -757,6 +777,7 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
             "message": payload.message,
         }
         slot_id = task.edge_slot_id if node_role == "edge" else task.cloud_slot_id
+        stage = (payload.stage or "runtime_load").strip().lower()
         if slot_id:
             slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
             if slot is not None:
@@ -773,13 +794,23 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
                     slot_fields["integrity_status"] = "healthy"
                 update_runtime_slot_state(db, slot, **slot_fields)
         if node_role == "edge":
-            update_kwargs["edge_progress"] = progress
             update_kwargs["edge_status"] = node_status
             update_kwargs["edge_message"] = payload.message
+            if stage == "integrity":
+                update_kwargs["edge_integrity_progress"] = progress
+            else:
+                update_kwargs["edge_runtime_load_progress"] = progress
+                if node_status in {"ready", "completed"} and task.edge_integrity_progress == 0:
+                    update_kwargs["edge_integrity_progress"] = 100
         else:
-            update_kwargs["cloud_progress"] = progress
             update_kwargs["cloud_status"] = node_status
             update_kwargs["cloud_message"] = payload.message
+            if stage == "integrity":
+                update_kwargs["cloud_integrity_progress"] = progress
+            else:
+                update_kwargs["cloud_runtime_load_progress"] = progress
+                if node_status in {"ready", "completed"} and task.cloud_integrity_progress == 0:
+                    update_kwargs["cloud_integrity_progress"] = 100
 
         task = update_task(db, task, **update_kwargs)
 
