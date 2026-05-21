@@ -32,6 +32,7 @@ class ScheduleTask(Base):
     task_id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
     openwebui_user_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     edge_session_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    runtime_binding_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
     model_type: Mapped[str] = mapped_column(String, index=True)
     status: Mapped[str] = mapped_column(String, default="accepted")
     phase: Mapped[str] = mapped_column(String, default="strategy")
@@ -42,10 +43,20 @@ class ScheduleTask(Base):
     cloud_device_id: Mapped[str | None] = mapped_column(String, nullable=True)
     edge_progress: Mapped[int] = mapped_column(Integer, default=0)
     cloud_progress: Mapped[int] = mapped_column(Integer, default=0)
+    edge_strategy_progress: Mapped[int] = mapped_column(Integer, default=0)
+    edge_integrity_progress: Mapped[int] = mapped_column(Integer, default=0)
+    edge_runtime_load_progress: Mapped[int] = mapped_column(Integer, default=0)
+    cloud_strategy_progress: Mapped[int] = mapped_column(Integer, default=0)
+    cloud_integrity_progress: Mapped[int] = mapped_column(Integer, default=0)
+    cloud_runtime_load_progress: Mapped[int] = mapped_column(Integer, default=0)
     edge_status: Mapped[str] = mapped_column(String, default="pending")
     cloud_status: Mapped[str] = mapped_column(String, default="pending")
     queue_status: Mapped[str] = mapped_column(String, default="pending")
     queue_position: Mapped[int] = mapped_column(Integer, default=0)
+    edge_slot_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    cloud_slot_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    allocated_cloud_slot_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    spawned_cloud_slot: Mapped[str | None] = mapped_column(String, nullable=True)
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     edge_message: Mapped[str] = mapped_column(String, default="等待边端模型加载")
     cloud_message: Mapped[str] = mapped_column(String, default="等待云端模型加载")
@@ -68,7 +79,9 @@ class EdgeSession(Base):
     status: Mapped[str] = mapped_column(String, default="active")
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_active_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 def init_db_data():
@@ -103,3 +116,46 @@ def init_db_data():
         db.commit()
 
     db.close()
+
+
+
+class RuntimeSlot(Base):
+    __tablename__ = "runtime_slots"
+
+    slot_id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+    role: Mapped[str] = mapped_column(String, index=True)
+    control_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    grpc_target: Mapped[str | None] = mapped_column(String, nullable=True)
+    process_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spawned_by_scheduler: Mapped[int] = mapped_column(Integer, default=0)
+    base_env_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    slot_index: Mapped[int] = mapped_column(Integer, default=0)
+    process_state: Mapped[str] = mapped_column(String, default="running")
+    model_state: Mapped[str] = mapped_column(String, default="empty")
+    slot_state: Mapped[str] = mapped_column(String, default="free")
+    owner_session_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    owner_binding_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    model_type: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    active_request_count: Mapped[int] = mapped_column(Integer, default=0)
+    integrity_status: Mapped[str] = mapped_column(String, default="unknown")
+    confirmation_status: Mapped[str] = mapped_column(String, default="none")
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    idle_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    process_idle_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RuntimeBinding(Base):
+    __tablename__ = "runtime_bindings"
+
+    binding_id: Mapped[str] = mapped_column(String, primary_key=True, index=True)
+    session_id: Mapped[str] = mapped_column(String, index=True)
+    task_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    edge_slot_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    cloud_slot_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    partition_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="binding")
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -23,10 +23,10 @@
 当前由后端配置项控制：
 
 ```text
-ALGORITHM_API_URL
+ALGORITHM_REAL_API_URL
 ```
 
-当前代码默认值：
+当前默认值示例：
 
 ```text
 http://127.0.0.1:8050/infer
@@ -34,8 +34,21 @@ http://127.0.0.1:8050/infer
 
 说明：
 
-- `ALGORITHM_API_URL` 需要根据算法模块真实服务地址修改
-- 当前本地 mock 联调时，也可以临时改到其他端口，例如 `http://127.0.0.1:5000/infer`
+- 正式 / 真实算法服务地址由 `ALGORITHM_REAL_API_URL` 控制
+- 若切到 mock 模式，则由：
+
+```text
+ALGORITHM_MOCK_API_URL
+```
+
+控制
+- 当前是否走 mock 由：
+
+```text
+ALGORITHM_USE_MOCK
+```
+
+决定
 
 ### 请求方法
 
@@ -163,12 +176,6 @@ Content-Type: application/json
 ALGORITHM_API_TIMEOUT_SECONDS
 ```
 
-- 当前默认值：
-
-```text
-30
-```
-
 - 后端会直接读取同步返回的 JSON
 - 不再等待异步回调
 
@@ -266,7 +273,7 @@ ALGORITHM_API_TIMEOUT_SECONDS
 1. 校验 `status`
 2. 校验并解析 `layer_partitions`
 3. 将结果保存到任务的 `strategy_payload`
-4. 进入加载资源判定
+4. 进入模型加载阶段
 5. 向边端模型推理服务和云端模型推理服务下发 `/load_strategy`
 6. 等待两边模型推理服务回调加载进度
 
@@ -292,4 +299,4 @@ ALGORITHM_API_TIMEOUT_SECONDS
 
 一句话总结：
 
-**云端后端现在直接发 `model_type + prompt_len + env JSON` 到 `/infer`，算法服务直接同步返回 `status + model_type + layer_partitions`。**
+**云端后端现在直接发 `model_type + prompt_len + env JSON` 到算法服务的 `/infer`，算法服务直接同步返回 `status + model_type + layer_partitions`。**

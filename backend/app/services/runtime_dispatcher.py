@@ -33,8 +33,14 @@ def build_runtime_control_url(node_role: str, device_ip: str) -> str:
     return f"http://{target_host}:{port}{control_path}"
 
 
-async def dispatch_strategy_to_runtime(*, node_role: str, device_ip: str, payload: dict) -> dict:
-    runtime_url = build_runtime_control_url(node_role, device_ip)
+async def dispatch_strategy_to_runtime(
+    *,
+    node_role: str,
+    device_ip: str,
+    payload: dict,
+    control_url: str | None = None,
+) -> dict:
+    runtime_url = control_url or build_runtime_control_url(node_role, device_ip)
     async with httpx.AsyncClient() as client:
         response = await client.post(runtime_url, json=payload, timeout=5.0)
         response.raise_for_status()

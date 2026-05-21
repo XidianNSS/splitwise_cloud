@@ -34,7 +34,6 @@ class PrometheusMetricsCache:
     def clear(self) -> None:
         self._cache.clear()
 
-
 # 聚合查询：返回给调度算法的整机视图
 PROMETHEUS_QUERY_TEMPLATES = {
     "nvidia": {
@@ -74,6 +73,10 @@ CHIP_ID_LABEL = {
 
 prometheus_metrics_cache = PrometheusMetricsCache(ttl_seconds=settings.PROMETHEUS_CACHE_SECONDS)
 
+def resolve_accelerator_type(ip: str) -> str:
+    """按 IP 白名单决定走 ascend 模板还是 nvidia 模板。"""
+    return "ascend" if ip in settings.ASCEND_IPS else "nvidia"
+
 
 def resolve_accelerator_type(ip: str) -> str:
     """按 IP 白名单决定走 ascend 模板还是 nvidia 模板。"""
@@ -95,6 +98,23 @@ async def query_prom(client: httpx.AsyncClient, query: str) -> float:
     except Exception as exc:
         logger.warning("Prometheus 查询失败，已回退为 0.0: %s, error=%s", query, exc)
     return 0.0
+
+async def query_prom_series(client: httpx.AsyncClient, query: str) -> list[dict]:
+    """返回 [{labels, value}, ...]，用于分片展示。"""
+    try:
+        response = await client.get(
+            f"{settings.PROMETHEUS_URL}/api/v1/query",
+            params={"query": query},
+            timeout=settings.PROMETHEUS_QUERY_TIMEOUT,
+        )
+        results = response.json().get("data", {}).get("result", [])
+        return [
+            {"labels": r.get("metric", {}), "value": float(r.get("value", [0, "0"])[1])}
+            for r in results
+        ]
+    except Exception as exc:
+        logger.warning("Prometheus 分片查询失败: %s, error=%s", query, exc)
+        return []
 
 
 async def query_prom_series(client: httpx.AsyncClient, query: str) -> list[dict]:
@@ -122,7 +142,7 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
     agg_queries = {name: tpl.format(ip_regex=ip_regex) for name, tpl in agg_templates.items()}
     chip_templates = PER_CHIP_QUERY_TEMPLATES.get(accelerator_type, {})
     chip_queries = {name: tpl.format(ip_regex=ip_regex) for name, tpl in chip_templates.items()}
-
+    
     async with httpx.AsyncClient() as client:
         agg_results = await asyncio.gather(*(query_prom(client, q) for q in agg_queries.values()))
         chip_series_results = await asyncio.gather(
@@ -156,6 +176,7 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
         "memory_percent": round(mem, 2),
         "gpu_util_percent": round(gpu_util, 2),
         "gpu_mem_used_mb": round(gpu_used, 2),
+        "gpu_mem_total_mb": round(gpu_used + gpu_free, 2) if (gpu_used + gpu_free) > 0 else 1.0,
         "gpu_mem_total_mb": round(gpu_total, 2) if gpu_total > 0 else 1.0,
         "accelerator_type": accelerator_type,
         "chips": sorted(chips.values(), key=lambda c: c["chip_id"]),

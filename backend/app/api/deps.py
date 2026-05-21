@@ -1,3 +1,4 @@
+import os
 from datetime import datetime
 
 from fastapi import Depends, Header, HTTPException, Request
@@ -120,13 +121,17 @@ async def get_current_edge_session(
     if edge_session.openwebui_user_id != openwebui_user_id:
         raise HTTPException(status_code=403, detail="会话所属用户与当前 OpenWebUI token 不一致")
 
-    if edge_session.expires_at <= datetime.utcnow():
+    now = datetime.utcnow()
+    lease_expires_at = edge_session.lease_expires_at if getattr(edge_session, "lease_expires_at", None) is not None else edge_session.expires_at
+    if lease_expires_at <= now:
         edge_session.status = "expired"
+        edge_session.lease_expires_at = edge_session.expires_at if getattr(edge_session, "lease_expires_at", None) is None else edge_session.lease_expires_at
         db.add(edge_session)
         db.commit()
         raise HTTPException(status_code=401, detail="会话已过期，请重新初始化")
 
-    edge_session.updated_at = datetime.utcnow()
+    edge_session.updated_at = now
+    edge_session.last_active_at = now
     db.add(edge_session)
     db.commit()
     db.refresh(edge_session)
@@ -141,3 +146,16 @@ async def get_current_admin(
     if not user or user.role != "admin":
         raise HTTPException(status_code=403, detail="权限不足！只有管理员可执行此操作")
     return user
+
+
+async def verify_runtime_integrity_token(authorization: str = Header(..., alias="Authorization")) -> None:
+    expected = os.getenv("RUNTIME_INTEGRITY_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="RUNTIME_INTEGRITY_TOKEN 未配置")
+    prefix = "Bearer "
+    if not authorization.startswith(prefix):
+        raise HTTPException(status_code=401, detail="缺少 Bearer token")
+    token = authorization[len(prefix):].strip()
+    if token != expected:
+        raise HTTPException(status_code=401, detail="runtime integrity token 无效")
+    return None

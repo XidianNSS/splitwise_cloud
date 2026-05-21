@@ -71,6 +71,7 @@ class RuntimeProgressCallbackRequest(BaseModel):
     status: str
     progress: int
     message: str
+    stage: Optional[str] = None
     node_role: Optional[str] = None
 
 
@@ -92,10 +93,22 @@ class ScheduleTaskStatusResponse(BaseModel):
     message: str
     edge_progress: int
     cloud_progress: int
+    edge_strategy_progress: int
+    edge_integrity_progress: int
+    edge_runtime_load_progress: int
+    cloud_strategy_progress: int
+    cloud_integrity_progress: int
+    cloud_runtime_load_progress: int
     edge_status: str
     cloud_status: str
     edge_message: str
     cloud_message: str
+    queue_status: Optional[str] = None
+    queue_position: Optional[int] = None
+    runtime_binding_id: Optional[str] = None
+    edge_slot_id: Optional[str] = None
+    cloud_slot_id: Optional[str] = None
+    allocated_cloud_slot_id: Optional[str] = None
     error_detail: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -105,3 +118,77 @@ class ScheduleTaskStrategyResponse(BaseModel):
     task_id: str
     model_type: str
     decision: StrategyDisplayDecisionPayload
+
+
+class RuntimeSlotStatusResponse(BaseModel):
+    slot_id: str
+    role: str
+    control_url: Optional[str] = None
+    grpc_target: Optional[str] = None
+    process_pid: Optional[int] = None
+    spawned_by_scheduler: bool = False
+    base_env_name: Optional[str] = None
+    slot_index: int = 0
+    process_state: str
+    model_state: str
+    slot_state: str
+    owner_session_id: Optional[str] = None
+    owner_binding_id: Optional[str] = None
+    model_type: Optional[str] = None
+    task_id: Optional[str] = None
+    active_request_count: int
+    integrity_status: str
+    confirmation_status: str
+    last_used_at: Optional[str] = None
+    idle_deadline: Optional[str] = None
+    process_idle_deadline: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class RuntimeBindingStatusResponse(BaseModel):
+    binding_id: str
+    session_id: str
+    task_id: Optional[str] = None
+    edge_slot_id: Optional[str] = None
+    cloud_slot_id: Optional[str] = None
+    partition_digest: Optional[str] = None
+    status: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SessionHeartbeatRequest(BaseModel):
+    session_id: str
+
+
+class SessionHeartbeatResponse(BaseModel):
+    session_id: str
+    status: str
+    lease_expires_at: str
+    message: str
+
+
+class SessionCloseRequest(BaseModel):
+    session_id: str
+
+
+class SessionCloseResponse(BaseModel):
+    session_id: str
+    status: str
+    message: str
+
+
+class CloudRuntimeConfirmationRequest(BaseModel):
+    task_id: str
+    cloud_slot_id: Optional[str] = None
+    model_type: str
+    server_param_digest: str
+    partition_digest: str
+    timestamp: int
+    nonce: str
+
+
+class CloudRuntimeConfirmationResponse(BaseModel):
+    matched: bool
+    reason: Optional[str] = None

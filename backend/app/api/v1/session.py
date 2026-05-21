@@ -15,7 +15,16 @@ from app.api.deps import (
 from app.models.models import Device, EdgeSession
 from app.core.security import extract_claim
 from app.core.config import settings
-from app.schemas.schemas import SessionInitRequest, SessionInitResponse
+from app.services.schedule_orchestrator import promote_waiting_loading_task
+from app.services.slot_reaper import cleanup_runtime_slots_for_session, release_bindings_for_session
+from app.schemas.schemas import (
+    SessionCloseRequest,
+    SessionCloseResponse,
+    SessionHeartbeatRequest,
+    SessionHeartbeatResponse,
+    SessionInitRequest,
+    SessionInitResponse,
+)
 
 router = APIRouter()
 
@@ -51,7 +60,7 @@ async def init_openwebui_session(
             EdgeSession.edge_device_id == edge_device.id,
             EdgeSession.edge_ip == edge_ip,
             EdgeSession.status == "active",
-            EdgeSession.expires_at > now,
+            EdgeSession.lease_expires_at > now,
         )
         .order_by(EdgeSession.updated_at.desc())
         .first()
@@ -59,6 +68,9 @@ async def init_openwebui_session(
 
     if active_session:
         active_session.updated_at = now
+        active_session.last_active_at = now
+        active_session.expires_at = now + timedelta(hours=2)
+        active_session.lease_expires_at = active_session.expires_at
         active_session.cloud_device_id = "cloud"
         db.add(active_session)
         db.commit()
@@ -76,7 +88,9 @@ async def init_openwebui_session(
             status="active",
             created_at=now,
             updated_at=now,
+            last_active_at=now,
             expires_at=expires_at,
+            lease_expires_at=expires_at,
         )
         db.add(new_session)
         db.commit()
@@ -102,3 +116,76 @@ async def init_openwebui_session(
         },
         "message": "OpenWebUI token 校验通过，边端设备识别完成，会话初始化成功",
     }
+
+
+
+@router.post("/session/heartbeat", response_model=SessionHeartbeatResponse, summary="刷新普通用户会话租约")
+async def heartbeat_openwebui_session(
+    payload: SessionHeartbeatRequest,
+    openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    db: Session = Depends(get_db),
+):
+    now = datetime.utcnow()
+    edge_session = (
+        db.query(EdgeSession)
+        .filter(
+            EdgeSession.session_id == payload.session_id,
+            EdgeSession.openwebui_user_id == openwebui_user_id,
+        )
+        .first()
+    )
+    if not edge_session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if edge_session.status in {"closed", "expired"}:
+        raise HTTPException(status_code=409, detail="会话已关闭或已过期")
+
+    lease_expires_at = now + timedelta(hours=2)
+    edge_session.status = "active"
+    edge_session.updated_at = now
+    edge_session.last_active_at = now
+    edge_session.expires_at = lease_expires_at
+    edge_session.lease_expires_at = lease_expires_at
+    db.add(edge_session)
+    db.commit()
+    db.refresh(edge_session)
+    return SessionHeartbeatResponse(
+        session_id=edge_session.session_id,
+        status=edge_session.status,
+        lease_expires_at=edge_session.lease_expires_at.isoformat(),
+        message="会话租约已刷新",
+    )
+
+
+@router.post("/session/close", response_model=SessionCloseResponse, summary="关闭普通用户会话")
+async def close_openwebui_session(
+    payload: SessionCloseRequest,
+    openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+    db: Session = Depends(get_db),
+):
+    edge_session = (
+        db.query(EdgeSession)
+        .filter(
+            EdgeSession.session_id == payload.session_id,
+            EdgeSession.openwebui_user_id == openwebui_user_id,
+        )
+        .first()
+    )
+    if not edge_session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    now = datetime.utcnow()
+    edge_session.status = "closed"
+    edge_session.updated_at = now
+    edge_session.last_active_at = now
+    edge_session.lease_expires_at = now
+    db.add(edge_session)
+    db.commit()
+    db.refresh(edge_session)
+    release_bindings_for_session(db, edge_session.session_id)
+    await cleanup_runtime_slots_for_session(db, edge_session.session_id)
+    await promote_waiting_loading_task()
+    return SessionCloseResponse(
+        session_id=edge_session.session_id,
+        status=edge_session.status,
+        message="会话已关闭",
+    )

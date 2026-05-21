@@ -6,6 +6,7 @@ from app.services.schedule_task_service import update_task
 STRATEGY_RUNNING_STATUS = "running_strategy"
 STRATEGY_QUEUED_STATUS = "queued_strategy"
 LOADING_RUNNING_STATUS = "running_loading"
+WAITING_CLOUD_SLOT_STATUS = "waiting_cloud_slot"
 
 
 def find_running_strategy_task(db: Session) -> ScheduleTask | None:
