@@ -5,6 +5,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
+from app.services.managed_cloud_slot_cleanup_service import clear_slot_ownership, stop_and_clear_managed_cloud_slot
 from app.services.runtime_binding_service import update_runtime_binding
 from app.services.runtime_slot_service import update_runtime_slot_state
 
@@ -69,21 +70,10 @@ def _fail_task(task: ScheduleTask | None, message: str) -> None:
 
 
 def _clear_slot_owner(db: Session, slot: RuntimeSlot, *, process_state: str | None = None) -> RuntimeSlot:
-    fields = {
-        'slot_state': 'free',
-        'model_state': 'empty',
-        'owner_session_id': None,
-        'owner_binding_id': None,
-        'model_type': None,
-        'task_id': None,
-        'active_request_count': 0,
-        'integrity_status': 'unknown',
-        'confirmation_status': 'none',
-        'last_used_at': datetime.utcnow(),
-    }
-    if process_state is not None:
-        fields['process_state'] = process_state
-    return update_runtime_slot_state(db, slot, **fields)
+    if slot.role == 'cloud' and bool(getattr(slot, 'spawned_by_scheduler', 0)) and process_state == 'stopped':
+        cleared_slot, _ = stop_and_clear_managed_cloud_slot(db, slot)
+        return cleared_slot
+    return clear_slot_ownership(db, slot, process_state=process_state)
 
 
 def _release_binding(binding: RuntimeBinding | None) -> None:
@@ -167,15 +157,14 @@ def reconcile_runtime_ownership(db: Session) -> None:
         session = _get_session(db, slot.owner_session_id)
         task = _get_task(db, slot.task_id)
 
-        if binding is not None and binding.status == 'released':
-            _clear_slot_owner(db, slot)
-            continue
-        if session is not None and session.status in _FINISHED_SESSION_STATUSES:
-            if binding is not None:
-                _release_binding(binding)
-            _clear_slot_owner(db, slot)
-            continue
-        if task is not None and task.status in {'failed'}:
+        binding_missing = slot.owner_binding_id is not None and binding is None
+        session_missing = slot.owner_session_id is not None and session is None
+        task_missing = slot.task_id is not None and task is None
+        binding_released = binding is not None and binding.status == 'released'
+        session_finished = session is not None and session.status in _FINISHED_SESSION_STATUSES
+        task_failed = task is not None and task.status in {'failed'}
+
+        if binding_missing or session_missing or task_missing or binding_released or session_finished or task_failed:
             if binding is not None:
                 _release_binding(binding)
             _clear_slot_owner(db, slot)

@@ -27,7 +27,8 @@ from app.services.runtime_dispatcher import (
     dispatch_strategy_to_runtime,
     extract_ip,
 )
-from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process, start_decode_server_process_for_slot, wait_for_slot_health
+from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process_for_slot_locked, start_decode_server_process_locked, wait_for_slot_health
+from app.services.managed_cloud_slot_cleanup_service import prepare_managed_cloud_slot_for_start
 from app.services.runtime_startup_admission import check_runtime_startup_resources
 from app.services.schedule_presenter import clamp_progress
 from app.services.runtime_control_service import unload_runtime_slot
@@ -76,14 +77,17 @@ def _next_cloud_slot_index(db: Session) -> int:
     return max(slot.slot_index for slot in cloud_slots) + 1
 
 
-async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip: str) -> tuple[RuntimeSlot, bool]:
+async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip: str | None = None) -> tuple[RuntimeSlot, bool]:
     free_slot = get_running_free_cloud_slot(db)
     if free_slot is not None and free_slot.owner_binding_id in {None, task.runtime_binding_id}:
         return free_slot, False
 
     stopped_slot = get_stopped_free_cloud_slot(db)
     if stopped_slot is not None and stopped_slot.owner_binding_id in {None, task.runtime_binding_id}:
-        process_info = start_decode_server_process_for_slot(stopped_slot.slot_id, stopped_slot.slot_index)
+        stopped_slot, prepared_ok = prepare_managed_cloud_slot_for_start(db, stopped_slot)
+        if not prepared_ok:
+            raise RuntimeError(f"cloud slot {stopped_slot.slot_id} 残留进程无法清理，等待 reconcile 后再启动")
+        process_info = await start_decode_server_process_for_slot_locked(stopped_slot.slot_id, stopped_slot.slot_index)
         health_ok = await wait_for_slot_health(process_info.control_url)
         if not health_ok:
             from app.services.decode_server_process_manager import stop_slot_process
@@ -119,7 +123,7 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
     if slot_index >= settings.CLOUD_SLOT_MAX_COUNT:
         raise RuntimeError("没有可用的 cloud decode slot，且已达到开发环境最大 slot 数")
 
-    process_info = start_decode_server_process(slot_index)
+    process_info = await start_decode_server_process_locked(slot_index)
     health_ok = await wait_for_slot_health(process_info.control_url)
     if not health_ok:
         from app.services.decode_server_process_manager import stop_slot_process
@@ -383,7 +387,7 @@ async def dispatch_loading_task(task_id: str) -> None:
             control_url=build_runtime_control_url("edge", edge_ip),
         )
         try:
-            cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task, cloud_ip)
+            cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task)
         except Exception as exc:
             await fail_task_and_promote(db, task, "云端 decode slot 分配失败", str(exc))
             return

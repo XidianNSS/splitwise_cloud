@@ -33,6 +33,7 @@ from app.services.decode_server_process_manager import allocate_cloud_slot_ports
 from app.services.managed_cloud_slot_bootstrap_service import bootstrap_managed_cloud_slots
 from app.services.runtime_slot_reconcile_service import reconcile_all_runtime_slots, reconcile_runtime_slot
 from app.services.startup_recovery_service import recover_runtime_ownership_on_startup, reconcile_runtime_ownership
+from app.services.schedule_recovery import recover_schedule_tasks_on_startup
 
 
 class SessionAndSlotLifecycleTest(unittest.TestCase):
@@ -200,7 +201,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
                 model_state="empty",
                 process_idle_deadline=datetime.utcnow() - timedelta(seconds=1),
             )
-            with patch("app.services.slot_reaper.stop_slot_process", return_value=True) as stop_mock:
+            with patch("app.services.managed_cloud_slot_cleanup_service.stop_slot_process", return_value=True) as stop_mock:
                 stopped = stop_idle_spawned_cloud_slots(db)
             self.assertEqual(stopped, ["cloud-slot-1"])
             stop_mock.assert_called_once_with("cloud-slot-1", process_pid=54321)
@@ -239,7 +240,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
                 model_state="empty",
                 process_idle_deadline=datetime.utcnow() - timedelta(seconds=1),
             )
-            with patch("app.services.slot_reaper.stop_slot_process", return_value=False) as stop_mock:
+            with patch("app.services.managed_cloud_slot_cleanup_service.stop_slot_process", return_value=False) as stop_mock:
                 stopped = stop_idle_spawned_cloud_slots(db)
             self.assertEqual(stopped, [])
             stop_mock.assert_called_once_with("cloud-slot-1", process_pid=67890)
@@ -484,7 +485,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
 
         import asyncio
         with (
-            patch("app.services.schedule_orchestrator.start_decode_server_process", return_value=process_info),
+            patch("app.services.schedule_orchestrator.start_decode_server_process_locked", new=AsyncMock(return_value=process_info)),
             patch("app.services.schedule_orchestrator.wait_for_slot_health", new=AsyncMock(return_value=True)),
             patch("app.services.schedule_orchestrator.dispatch_strategy_to_runtime", new=AsyncMock(return_value={"status": "accepted"})),
         ):
@@ -613,6 +614,129 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_reconcile_runtime_ownership_clears_missing_binding_owner(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id="binding-missing", task_id="task-missing-binding")
+            reconcile_runtime_ownership(db)
+            db.refresh(slot)
+            self.assertEqual(slot.slot_state, "free")
+            self.assertIsNone(slot.owner_binding_id)
+        finally:
+            db.close()
+
+    def test_reconcile_runtime_ownership_clears_missing_session_owner(self) -> None:
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-ghost",
+                task_id="task-missing-session",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, slot, slot_state="bound", model_state="ready", owner_session_id="session-ghost", owner_binding_id=binding.binding_id, task_id="task-missing-session")
+            reconcile_runtime_ownership(db)
+            db.refresh(slot)
+            db.refresh(binding)
+            self.assertEqual(binding.status, "released")
+            self.assertEqual(slot.slot_state, "free")
+            self.assertIsNone(slot.owner_session_id)
+        finally:
+            db.close()
+
+    def test_startup_recovery_does_not_fake_stop_managed_cloud_slot_when_process_stop_fails(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-recovery-stop-fails",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            update_runtime_binding(db, binding, status="released")
+            slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:9010/load_strategy",
+                grpc_target="127.0.0.1:51100",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                process_state="running",
+                process_pid=98765,
+                base_env_name=".env.prod",
+            )
+            update_runtime_slot_state(
+                db,
+                slot,
+                slot_state="bound",
+                model_state="ready",
+                owner_session_id="session-1",
+                owner_binding_id=binding.binding_id,
+                task_id="task-recovery-stop-fails",
+            )
+            with patch("app.services.managed_cloud_slot_cleanup_service.stop_slot_process", return_value=False) as stop_mock:
+                recover_runtime_ownership_on_startup(db)
+            db.refresh(slot)
+            stop_mock.assert_called_once_with("cloud-slot-0", process_pid=98765)
+            self.assertEqual(slot.process_state, "failed")
+            self.assertEqual(slot.slot_state, "needs_reconcile")
+            self.assertEqual(slot.model_state, "failed")
+            self.assertEqual(slot.process_pid, 98765)
+        finally:
+            db.close()
+
+    def test_startup_recovery_stops_managed_cloud_slot_before_marking_stopped(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-recovery-stop-ok",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            update_runtime_binding(db, binding, status="released")
+            slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:9010/load_strategy",
+                grpc_target="127.0.0.1:51100",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                process_state="running",
+                process_pid=98766,
+                base_env_name=".env.prod",
+            )
+            update_runtime_slot_state(
+                db,
+                slot,
+                slot_state="bound",
+                model_state="ready",
+                owner_session_id="session-1",
+                owner_binding_id=binding.binding_id,
+                task_id="task-recovery-stop-ok",
+            )
+            with patch("app.services.managed_cloud_slot_cleanup_service.stop_slot_process", return_value=True) as stop_mock:
+                recover_runtime_ownership_on_startup(db)
+            db.refresh(slot)
+            stop_mock.assert_called_once_with("cloud-slot-0", process_pid=98766)
+            self.assertEqual(slot.process_state, "stopped")
+            self.assertEqual(slot.slot_state, "free")
+            self.assertEqual(slot.model_state, "empty")
+            self.assertIsNone(slot.process_pid)
+            self.assertIsNone(slot.owner_binding_id)
+        finally:
+            db.close()
+
     def test_startup_recovery_preserves_trustworthy_completed_binding(self) -> None:
         self._create_session()
         db = SessionLocal()
@@ -653,6 +777,68 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             db.refresh(binding)
             self.assertEqual(task.status, "completed")
             self.assertEqual(binding.status, "binding")
+        finally:
+            db.close()
+
+    def test_startup_recovery_uses_new_session_for_async_cleanup(self) -> None:
+        expired_at = datetime.utcnow() - timedelta(minutes=1)
+        self._create_session(status="expired", lease_expires_at=expired_at)
+        db = SessionLocal()
+        try:
+            create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-expired-cleanup",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+        finally:
+            db.close()
+
+        scheduled = []
+
+        class _FakeLoop:
+            def create_task(self, coro):
+                scheduled.append(coro)
+                return coro
+
+        with patch('app.services.schedule_recovery.asyncio.get_running_loop', return_value=_FakeLoop()):
+            recover_schedule_tasks_on_startup()
+
+        self.assertEqual(len(scheduled), 1)
+        import asyncio
+        asyncio.run(scheduled[0])
+
+    def test_bootstrap_managed_cloud_slot_zero_degrades_when_health_fails(self) -> None:
+        db = SessionLocal()
+        try:
+            process_info = MagicMock(
+                slot_id='cloud-slot-0',
+                slot_index=0,
+                http_port=19114,
+                grpc_port=52164,
+                control_url='http://127.0.0.1:19114/load_strategy',
+                grpc_target='127.0.0.1:52164',
+                process_pid=32109,
+            )
+            with (
+                patch('app.services.managed_cloud_slot_bootstrap_service.start_decode_server_process_for_slot_locked', new=AsyncMock(return_value=process_info)),
+                patch('app.services.managed_cloud_slot_bootstrap_service.wait_for_slot_health', new=AsyncMock(return_value=False)),
+                patch('app.services.decode_server_process_manager.stop_slot_process', return_value=True),
+            ):
+                import asyncio
+                asyncio.run(bootstrap_managed_cloud_slots(db))
+        finally:
+            db.close()
+
+        db = SessionLocal()
+        try:
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'cloud-slot-0').first()
+            self.assertIsNotNone(slot)
+            self.assertEqual(slot.process_state, 'failed')
+            self.assertEqual(slot.slot_state, 'needs_reconcile')
+            self.assertEqual(slot.model_state, 'failed')
+            self.assertEqual(slot.process_pid, 32109)
         finally:
             db.close()
 
@@ -942,6 +1128,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
                 slot_index=1,
                 spawned_by_scheduler=True,
                 process_state="stopped",
+                process_pid=98765,
             )
             task = ScheduleTask(
                 task_id="task-reuse-stopped-slot",
@@ -998,12 +1185,14 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         try:
             task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-reuse-stopped-slot").first()
             with (
-                patch("app.services.schedule_orchestrator.start_decode_server_process_for_slot", return_value=process_info) as restart_mock,
+                patch("app.services.managed_cloud_slot_cleanup_service.stop_slot_process", return_value=True) as stop_mock,
+                patch("app.services.schedule_orchestrator.start_decode_server_process_for_slot_locked", new=AsyncMock(return_value=process_info)) as restart_mock,
                 patch("app.services.schedule_orchestrator.wait_for_slot_health", new=AsyncMock(return_value=True)),
             ):
                 slot, spawned = asyncio.run(allocate_cloud_slot_for_task(db, task, "127.0.0.1"))
             self.assertTrue(spawned)
             self.assertEqual(slot.slot_id, "cloud-slot-1")
+            stop_mock.assert_called_once_with("cloud-slot-1", process_pid=98765)
             restart_mock.assert_called_once_with("cloud-slot-1", 1)
         finally:
             db.close()
@@ -1075,7 +1264,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
 
         import asyncio
         with (
-            patch("app.services.schedule_orchestrator.start_decode_server_process", return_value=process_info),
+            patch("app.services.schedule_orchestrator.start_decode_server_process_locked", new=AsyncMock(return_value=process_info)),
             patch("app.services.schedule_orchestrator.wait_for_slot_health", new=AsyncMock(return_value=True)),
             patch("app.services.schedule_orchestrator.dispatch_strategy_to_runtime", new=AsyncMock(return_value={"status": "accepted"})),
         ):
@@ -1163,7 +1352,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
 
         import asyncio
         with (
-            patch("app.services.schedule_orchestrator.start_decode_server_process", return_value=process_info),
+            patch("app.services.schedule_orchestrator.start_decode_server_process_locked", new=AsyncMock(return_value=process_info)),
             patch("app.services.schedule_orchestrator.wait_for_slot_health", new=AsyncMock(return_value=True)),
             patch("app.services.schedule_orchestrator.dispatch_strategy_to_runtime", new=AsyncMock(side_effect=[{"status": "accepted"}, RuntimeError("cloud dispatch failed")])),
             patch("app.services.decode_server_process_manager.stop_slot_process", return_value=True) as stop_mock,
@@ -1377,6 +1566,49 @@ def test_reconcile_needs_reconcile_spawned_slot_returns_to_free_stopped(self) ->
     finally:
         db.close()
 
+def test_reconcile_orphan_failed_managed_cloud_slot_without_pid_returns_to_free_stopped(self) -> None:
+    db = SessionLocal()
+    try:
+        slot = ensure_runtime_slot(
+            db,
+            slot_id="cloud-slot-orphan",
+            role="cloud",
+            control_url="http://127.0.0.1:19119/load_strategy",
+            grpc_target="127.0.0.1:52169",
+            slot_index=3,
+            spawned_by_scheduler=True,
+            process_state="failed",
+            process_pid=None,
+            base_env_name=".env.prod",
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state="needs_reconcile",
+            model_state="failed",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+        )
+        import asyncio
+        asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "cloud-slot-orphan").first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, "stopped")
+        self.assertEqual(slot.slot_state, "free")
+        self.assertEqual(slot.model_state, "empty")
+        self.assertIsNone(slot.process_pid)
+        self.assertIsNone(slot.owner_session_id)
+        self.assertIsNone(slot.owner_binding_id)
+    finally:
+        db.close()
+
 def test_reconcile_finished_task_keeps_ready_managed_cloud_slot_bound(self) -> None:
     self._create_session()
     db = SessionLocal()
@@ -1572,7 +1804,7 @@ def test_reconcile_loading_managed_cloud_slot_tolerates_transient_health_failure
             task_id='task-loading',
         )
         with patch('app.services.runtime_slot_reconcile_service.inspect_slot_process', return_value=None), \
-             patch('app.services.runtime_slot_reconcile_service.stop_slot_process', return_value=True), \
+             patch('app.services.managed_cloud_slot_cleanup_service.stop_slot_process', return_value=True), \
              patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(side_effect=RuntimeError('warming up'))):
             import asyncio
             asyncio.run(reconcile_runtime_slot(db, slot))
@@ -1596,6 +1828,45 @@ def test_reconcile_loading_managed_cloud_slot_tolerates_transient_health_failure
     finally:
         db.close()
 
+
+def test_reconcile_base_or_edge_unreachable_clears_missing_binding_owner(self) -> None:
+    self._create_session()
+    db = SessionLocal()
+    try:
+        slot = ensure_runtime_slot(
+            db,
+            slot_id='edge-slot-edge_A',
+            role='edge',
+            control_url='http://127.0.0.1:19112/load_strategy',
+            process_state='running',
+        )
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state='bound',
+            model_state='ready',
+            owner_session_id='session-1',
+            owner_binding_id='binding-missing',
+            model_type='Llama-3.2-3B-Instruct',
+            task_id='task-edge-missing-binding',
+        )
+        with patch('app.services.runtime_slot_reconcile_service.fetch_runtime_state', new=AsyncMock(side_effect=RuntimeError('down'))):
+            import asyncio
+            asyncio.run(reconcile_runtime_slot(db, slot))
+    finally:
+        db.close()
+
+    db = SessionLocal()
+    try:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == 'edge-slot-edge_A').first()
+        self.assertIsNotNone(slot)
+        self.assertEqual(slot.process_state, 'failed')
+        self.assertEqual(slot.slot_state, 'free')
+        self.assertEqual(slot.model_state, 'empty')
+        self.assertIsNone(slot.owner_binding_id)
+        self.assertIsNone(slot.owner_session_id)
+    finally:
+        db.close()
 
 def test_reconcile_base_or_edge_unreachable_marks_needs_reconcile(self) -> None:
     self._create_session()
@@ -1749,7 +2020,7 @@ def test_bootstrap_managed_cloud_slot_zero_starts_decode_when_absent(self) -> No
             process_pid=32100,
         )
         with (
-            patch('app.services.managed_cloud_slot_bootstrap_service.start_decode_server_process_for_slot', return_value=process_info),
+            patch('app.services.managed_cloud_slot_bootstrap_service.start_decode_server_process_for_slot_locked', new=AsyncMock(return_value=process_info)),
             patch('app.services.managed_cloud_slot_bootstrap_service.wait_for_slot_health', new=AsyncMock(return_value=True)),
         ):
             import asyncio
@@ -1824,7 +2095,7 @@ def test_allocate_cloud_slot_reuses_stopped_cloud_slot_zero(self) -> None:
             process_pid=32101,
         )
         with (
-            patch('app.services.schedule_orchestrator.start_decode_server_process_for_slot', return_value=process_info),
+            patch('app.services.schedule_orchestrator.start_decode_server_process_for_slot_locked', new=AsyncMock(return_value=process_info)),
             patch('app.services.schedule_orchestrator.wait_for_slot_health', new=AsyncMock(return_value=True)),
         ):
             import asyncio
@@ -1856,7 +2127,7 @@ def test_stop_idle_managed_cloud_slot_zero_stops_process(self) -> None:
             model_state='empty',
             process_idle_deadline=datetime.utcnow() - timedelta(seconds=1),
         )
-        with patch('app.services.slot_reaper.stop_slot_process', return_value=True):
+        with patch('app.services.managed_cloud_slot_cleanup_service.stop_slot_process', return_value=True):
             stopped = stop_idle_spawned_cloud_slots(db)
         self.assertEqual(stopped, ['cloud-slot-0'])
     finally:

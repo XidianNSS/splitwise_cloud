@@ -3,7 +3,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot
-from app.services.decode_server_process_manager import stop_slot_process
+from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_slot_service import update_runtime_slot_state
 
@@ -132,23 +132,8 @@ def stop_idle_spawned_cloud_slots(db: Session) -> list[str]:
     )
     stopped: list[str] = []
     for slot in slots:
-        stopped_ok = stop_slot_process(slot.slot_id, process_pid=slot.process_pid)
+        _, stopped_ok = stop_and_clear_managed_cloud_slot(db, slot)
         if not stopped_ok:
-            update_runtime_slot_state(
-                db,
-                slot,
-                process_state="failed",
-                slot_state="needs_reconcile",
-                last_used_at=datetime.utcnow(),
-            )
             continue
-        update_runtime_slot_state(
-            db,
-            slot,
-            process_state="stopped",
-            process_pid=None,
-            process_idle_deadline=None,
-            last_used_at=datetime.utcnow(),
-        )
         stopped.append(slot.slot_id)
     return stopped

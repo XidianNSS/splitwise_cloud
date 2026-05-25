@@ -4,6 +4,7 @@ import signal
 import shlex
 import socket
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,7 @@ class DecodeSlotProcessInfo:
 
 
 _SLOT_PROCESSES: dict[str, subprocess.Popen] = {}
+_SLOT_PROCESS_LOCK = asyncio.Lock()
 
 
 def _port_in_use(port: int) -> bool:
@@ -97,12 +99,20 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{slot_id}.out.log"
     stderr_path = log_dir / f"{slot_id}.err.log"
-    process = subprocess.Popen(
-        ["/bin/bash", "-lc", command],
-        env=env,
-        stdout=stdout_path.open('ab'),
-        stderr=stderr_path.open('ab'),
-    )
+    stdout_handle = stdout_path.open('ab')
+    stderr_handle = stderr_path.open('ab')
+    try:
+        process = subprocess.Popen(
+            ["/bin/bash", "-lc", command],
+            env=env,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+        )
+    finally:
+        with suppress(Exception):
+            stdout_handle.close()
+        with suppress(Exception):
+            stderr_handle.close()
     _SLOT_PROCESSES[slot_id] = process
     return DecodeSlotProcessInfo(
         slot_id=slot_id,
@@ -196,6 +206,12 @@ async def wait_for_slot_health(control_url: str, *, timeout_seconds: float = 30.
     return False
 
 
-def start_decode_server_process(slot_index: int) -> DecodeSlotProcessInfo:
-    slot_id = f"cloud-slot-{slot_index}"
-    return start_decode_server_process_for_slot(slot_id, slot_index)
+async def start_decode_server_process_for_slot_locked(slot_id: str, slot_index: int) -> DecodeSlotProcessInfo:
+    async with _SLOT_PROCESS_LOCK:
+        return start_decode_server_process_for_slot(slot_id, slot_index)
+
+
+async def start_decode_server_process_locked(slot_index: int) -> DecodeSlotProcessInfo:
+    async with _SLOT_PROCESS_LOCK:
+        slot_id = f"cloud-slot-{slot_index}"
+        return start_decode_server_process_for_slot(slot_id, slot_index)

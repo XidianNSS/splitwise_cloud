@@ -78,11 +78,6 @@ def resolve_accelerator_type(ip: str) -> str:
     return "ascend" if ip in settings.ASCEND_IPS else "nvidia"
 
 
-def resolve_accelerator_type(ip: str) -> str:
-    """按 IP 白名单决定走 ascend 模板还是 nvidia 模板。"""
-    return "ascend" if ip in settings.ASCEND_IPS else "nvidia"
-
-
 async def query_prom(client: httpx.AsyncClient, query: str) -> float:
     try:
         response = await client.get(
@@ -98,24 +93,6 @@ async def query_prom(client: httpx.AsyncClient, query: str) -> float:
     except Exception as exc:
         logger.warning("Prometheus 查询失败，已回退为 0.0: %s, error=%s", query, exc)
     return 0.0
-
-async def query_prom_series(client: httpx.AsyncClient, query: str) -> list[dict]:
-    """返回 [{labels, value}, ...]，用于分片展示。"""
-    try:
-        response = await client.get(
-            f"{settings.PROMETHEUS_URL}/api/v1/query",
-            params={"query": query},
-            timeout=settings.PROMETHEUS_QUERY_TIMEOUT,
-        )
-        results = response.json().get("data", {}).get("result", [])
-        return [
-            {"labels": r.get("metric", {}), "value": float(r.get("value", [0, "0"])[1])}
-            for r in results
-        ]
-    except Exception as exc:
-        logger.warning("Prometheus 分片查询失败: %s, error=%s", query, exc)
-        return []
-
 
 async def query_prom_series(client: httpx.AsyncClient, query: str) -> list[dict]:
     """返回 [{labels, value}, ...]，用于分片展示。"""
