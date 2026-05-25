@@ -12,6 +12,14 @@ from app.services.slot_reaper import cleanup_runtime_slots_for_session, mark_exp
 from app.services.startup_recovery_service import recover_runtime_ownership_on_startup
 
 
+async def _cleanup_runtime_slots_for_session_with_new_session(session_id: str) -> None:
+    db = SessionLocal()
+    try:
+        await cleanup_runtime_slots_for_session(db, session_id)
+    finally:
+        db.close()
+
+
 def recover_schedule_tasks_on_startup() -> None:
     db = SessionLocal()
     try:
@@ -50,9 +58,9 @@ def recover_schedule_tasks_on_startup() -> None:
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                asyncio.run(cleanup_runtime_slots_for_session(db, session.session_id))
+                asyncio.run(_cleanup_runtime_slots_for_session_with_new_session(session.session_id))
             else:
-                loop.create_task(cleanup_runtime_slots_for_session(db, session.session_id))
+                loop.create_task(_cleanup_runtime_slots_for_session_with_new_session(session.session_id))
         recalculate_strategy_queue_positions(db)
     finally:
         db.close()

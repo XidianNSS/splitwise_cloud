@@ -6,7 +6,8 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
-from app.services.decode_server_process_manager import inspect_slot_process, stop_slot_process
+from app.services.decode_server_process_manager import inspect_slot_process
+from app.services.managed_cloud_slot_cleanup_service import clear_slot_ownership, stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_slot_service import update_runtime_slot_state
 
@@ -53,22 +54,10 @@ def _slot_is_active_loading(slot: RuntimeSlot, task: ScheduleTask | None) -> boo
 
 
 def _clear_slot_ownership(db: Session, slot: RuntimeSlot, *, process_state: str | None = None) -> RuntimeSlot:
-    fields = {
-        'slot_state': 'free',
-        'model_state': 'empty',
-        'owner_session_id': None,
-        'owner_binding_id': None,
-        'model_type': None,
-        'task_id': None,
-        'active_request_count': 0,
-        'integrity_status': 'unknown',
-        'confirmation_status': 'none',
-        'idle_deadline': None,
-        'last_used_at': datetime.utcnow(),
-    }
-    if process_state is not None:
-        fields['process_state'] = process_state
-    return update_runtime_slot_state(db, slot, **fields)
+    if slot.role == 'cloud' and bool(getattr(slot, 'spawned_by_scheduler', 0)) and process_state == 'stopped':
+        cleared_slot, _ = stop_and_clear_managed_cloud_slot(db, slot)
+        return cleared_slot
+    return clear_slot_ownership(db, slot, process_state=process_state)
 
 
 def _mark_task_failed_if_active(db: Session, task: ScheduleTask | None, message: str) -> None:
@@ -81,7 +70,6 @@ def _mark_task_failed_if_active(db: Session, task: ScheduleTask | None, message:
     task.queue_position = 0
     task.updated_at = datetime.utcnow()
     db.add(task)
-    db.commit()
 
 
 def _release_binding(db: Session, binding: RuntimeBinding | None) -> None:
@@ -91,7 +79,6 @@ def _release_binding(db: Session, binding: RuntimeBinding | None) -> None:
         binding.status = 'released'
         binding.updated_at = datetime.utcnow()
         db.add(binding)
-        db.commit()
 
 
 async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
@@ -150,21 +137,14 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
                 model_state='loading',
                 last_used_at=datetime.utcnow(),
             )
-        stopped_ok = stop_slot_process(slot.slot_id, process_pid=slot.process_pid)
+        if task_active:
+            _mark_task_failed_if_active(db, task, f'cloud slot {slot.slot_id} 健康检查失败，任务已失败')
+        if binding is not None:
+            _release_binding(db, binding)
+        cleared_slot, stopped_ok = stop_and_clear_managed_cloud_slot(db, slot)
         if stopped_ok:
-            if task_active:
-                _mark_task_failed_if_active(db, task, f'cloud slot {slot.slot_id} 健康检查失败，任务已失败')
-            if binding is not None:
-                _release_binding(db, binding)
-            return _clear_slot_ownership(db, slot, process_state='stopped')
-        return update_runtime_slot_state(
-            db,
-            slot,
-            process_state='failed',
-            slot_state='needs_reconcile',
-            model_state='failed',
-            last_used_at=datetime.utcnow(),
-        )
+            return cleared_slot
+        return cleared_slot
 
     try:
         state = await fetch_runtime_state(slot)
@@ -244,8 +224,9 @@ async def _reconcile_base_or_edge_slot(db: Session, slot: RuntimeSlot) -> Runtim
     try:
         state = await fetch_runtime_state(slot)
     except Exception:
-        if binding is not None and (binding_released or session_finished or task_finished):
-            _release_binding(db, binding)
+        if binding_released or session_finished or task_finished:
+            if binding is not None:
+                _release_binding(db, binding)
             return _clear_slot_ownership(db, slot, process_state='failed')
         return update_runtime_slot_state(
             db,
