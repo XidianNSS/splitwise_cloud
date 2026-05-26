@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db.database import SessionLocal
-from app.models.models import Device, EdgeSession, RuntimeSlot, ScheduleTask
+from app.models.models import Device, EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
 from app.services.algorithm_dispatcher import (
     build_algorithm_request_payload,
     derive_edge_storage_limit_gb_from_metrics,
@@ -31,7 +31,7 @@ from app.services.decode_server_process_manager import current_runtime_env_metad
 from app.services.managed_cloud_slot_cleanup_service import prepare_managed_cloud_slot_for_start
 from app.services.runtime_startup_admission import check_runtime_startup_resources
 from app.services.schedule_presenter import clamp_progress
-from app.services.runtime_control_service import unload_runtime_slot
+from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_binding_service import create_runtime_binding, update_runtime_binding
 from app.services.runtime_slot_service import (
     ensure_runtime_slot,
@@ -77,7 +77,280 @@ def _next_cloud_slot_index(db: Session) -> int:
     return max(slot.slot_index for slot in cloud_slots) + 1
 
 
+def _find_binding(db: Session, binding_id: str | None) -> RuntimeBinding | None:
+    if not binding_id:
+        return None
+    return db.query(RuntimeBinding).filter(RuntimeBinding.binding_id == binding_id).first()
+
+
+def _list_session_owned_cloud_slots(db: Session, session_id: str) -> list[RuntimeSlot]:
+    return (
+        db.query(RuntimeSlot)
+        .filter(
+            RuntimeSlot.role == "cloud",
+            RuntimeSlot.owner_session_id == session_id,
+        )
+        .order_by(RuntimeSlot.updated_at.desc(), RuntimeSlot.slot_index.asc(), RuntimeSlot.slot_id.asc())
+        .all()
+    )
+
+
+def _get_session_owned_edge_slot(db: Session, session_id: str) -> RuntimeSlot | None:
+    return (
+        db.query(RuntimeSlot)
+        .filter(
+            RuntimeSlot.role == "edge",
+            RuntimeSlot.owner_session_id == session_id,
+        )
+        .order_by(RuntimeSlot.updated_at.desc(), RuntimeSlot.slot_id.asc())
+        .first()
+    )
+
+
+def _select_authoritative_session_binding(db: Session, session_id: str) -> RuntimeBinding | None:
+    edge_slot = _get_session_owned_edge_slot(db, session_id)
+    if edge_slot is not None and edge_slot.owner_binding_id:
+        binding = _find_binding(db, edge_slot.owner_binding_id)
+        if binding is not None and binding.status == "binding":
+            return binding
+
+    return (
+        db.query(RuntimeBinding)
+        .filter(
+            RuntimeBinding.session_id == session_id,
+            RuntimeBinding.status == "binding",
+        )
+        .order_by(RuntimeBinding.updated_at.desc(), RuntimeBinding.created_at.desc(), RuntimeBinding.binding_id.desc())
+        .first()
+    )
+
+
+def find_active_session_runtime_binding(db: Session, session_id: str) -> RuntimeBinding | None:
+    return _select_authoritative_session_binding(db, session_id)
+
+
+def _get_session_reload_target(db: Session, session_id: str) -> tuple[RuntimeBinding | None, RuntimeSlot | None, RuntimeSlot | None]:
+    edge_slot = _get_session_owned_edge_slot(db, session_id)
+    binding = _select_authoritative_session_binding(db, session_id)
+    cloud_slot = None
+
+    if binding is not None and binding.cloud_slot_id:
+        cloud_slot = get_cloud_slot_by_id(db, binding.cloud_slot_id)
+    if cloud_slot is None and binding is not None:
+        cloud_slot = (
+            db.query(RuntimeSlot)
+            .filter(
+                RuntimeSlot.role == "cloud",
+                RuntimeSlot.owner_binding_id == binding.binding_id,
+            )
+            .order_by(RuntimeSlot.updated_at.desc(), RuntimeSlot.slot_index.asc(), RuntimeSlot.slot_id.asc())
+            .first()
+        )
+    if cloud_slot is None:
+        owned_cloud_slots = _list_session_owned_cloud_slots(db, session_id)
+        cloud_slot = owned_cloud_slots[0] if owned_cloud_slots else None
+
+    return binding, edge_slot, cloud_slot
+
+
+def find_active_session_cloud_slot(db: Session, session_id: str) -> RuntimeSlot | None:
+    binding, _edge_slot, cloud_slot = _get_session_reload_target(db, session_id)
+    if binding is None or cloud_slot is None:
+        return None
+    if cloud_slot.owner_session_id != session_id and cloud_slot.owner_binding_id != binding.binding_id:
+        return None
+    return cloud_slot
+
+
+def _session_slots_busy_for_new_load(edge_slot: RuntimeSlot | None, cloud_slot: RuntimeSlot | None) -> bool:
+    slots = [slot for slot in (edge_slot, cloud_slot) if slot is not None]
+    return any(
+        slot.slot_state == "unloading"
+        or slot.model_state in {"loading", "draining"}
+        or slot.process_state in {"starting", "stopping"}
+        for slot in slots
+    )
+
+
+def _runtime_state_has_loaded_model(state: dict) -> bool:
+    return bool(state.get("ready") or state.get("model_type") or state.get("task_id"))
+
+
+def _runtime_state_is_busy(state: dict) -> bool:
+    return bool(state.get("draining")) or int(state.get("active_request_count") or 0) > 0
+
+
+def _models_equal(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return canonicalize_model_type(left) == canonicalize_model_type(right)
+
+
+def _is_runtime_loading_conflict(exc: Exception) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response.status_code != 409:
+            return False
+        detail = exc.response.text or ""
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            detail = str(payload.get("detail") or detail)
+        return "already in progress" in detail or "loading" in detail
+    text = str(exc)
+    return "409 Conflict" in text and ("already in progress" in text or "loading" in text)
+
+
+def _all_dispatch_errors_are_loading_conflicts(errors: list[Exception]) -> bool:
+    return bool(errors) and all(_is_runtime_loading_conflict(error) for error in errors)
+
+
+def _supersede_active_session_task(
+    db: Session,
+    task: ScheduleTask,
+    *,
+    new_model_type: str,
+) -> None:
+    update_task(
+        db,
+        task,
+        status="failed",
+        message=f"模型加载任务已被新的模型请求取代: {new_model_type}",
+        error_detail=f"superseded_by_model={new_model_type}",
+        edge_message="当前加载任务已被新的模型请求取代",
+        cloud_message="当前加载任务已被新的模型请求取代",
+    )
+    if task.runtime_binding_id:
+        binding = _find_binding(db, task.runtime_binding_id)
+        if binding is not None:
+            update_runtime_binding(db, binding, status="released")
+
+
+def _mark_slot_needs_reconcile_with_owner(
+    db: Session,
+    slot: RuntimeSlot,
+    *,
+    owner_session_id: str | None,
+    owner_binding_id: str | None,
+    task_id: str | None,
+    model_type: str | None,
+) -> RuntimeSlot:
+    return update_runtime_slot_state(
+        db,
+        slot,
+        process_state="failed",
+        slot_state="needs_reconcile",
+        model_state="failed",
+        owner_session_id=owner_session_id,
+        owner_binding_id=owner_binding_id,
+        task_id=task_id,
+        model_type=model_type,
+        active_request_count=0,
+        idle_deadline=None,
+        process_idle_deadline=None,
+        last_used_at=datetime.utcnow(),
+    )
+
+
+def _release_non_authoritative_session_bindings(
+    db: Session,
+    session_id: str,
+    *,
+    keep_binding_id: str | None,
+) -> None:
+    bindings = (
+        db.query(RuntimeBinding)
+        .filter(
+            RuntimeBinding.session_id == session_id,
+            RuntimeBinding.status == "binding",
+        )
+        .all()
+    )
+    updated = False
+    now = datetime.utcnow()
+    for binding in bindings:
+        if keep_binding_id and binding.binding_id == keep_binding_id:
+            continue
+        binding.status = "released"
+        binding.updated_at = now
+        db.add(binding)
+        updated = True
+    if updated:
+        db.commit()
+
+
+async def _reload_session_owned_slots_for_task(
+    db: Session,
+    task: ScheduleTask,
+    *,
+    new_binding: RuntimeBinding,
+    edge_slot: RuntimeSlot,
+    cloud_slot: RuntimeSlot,
+) -> tuple[RuntimeSlot, RuntimeSlot]:
+    old_binding = _find_binding(db, edge_slot.owner_binding_id or cloud_slot.owner_binding_id)
+    if old_binding is None:
+        raise RuntimeError("当前会话缺少可复用的历史 binding，无法在同一 slot 上重加载")
+
+    old_owner = {
+        "owner_session_id": task.edge_session_id,
+        "owner_binding_id": old_binding.binding_id,
+        "task_id": old_binding.task_id or cloud_slot.task_id or edge_slot.task_id,
+        "model_type": cloud_slot.model_type or edge_slot.model_type or task.model_type,
+    }
+
+    if edge_slot.process_state != "running" or cloud_slot.process_state != "running":
+        raise RuntimeError("当前会话原有 runtime 进程状态异常，暂不能复用原 slot")
+
+    try:
+        cloud_state = await fetch_runtime_state(cloud_slot)
+        edge_state = await fetch_runtime_state(edge_slot)
+    except Exception as exc:
+        raise RuntimeError(f"当前会话原有 runtime 不健康，无法复用原 slot: {exc}") from exc
+
+    if (
+        _session_slots_busy_for_new_load(edge_slot, cloud_slot)
+        or _runtime_state_is_busy(cloud_state)
+        or _runtime_state_is_busy(edge_state)
+    ):
+        raise RuntimeError("当前会话仍有推理请求进行中，暂不能切换模型")
+
+    try:
+        if _runtime_state_has_loaded_model(cloud_state):
+            await unload_runtime_slot(
+                db,
+                cloud_slot,
+                reason=f"session {task.edge_session_id} reload cloud slot {cloud_slot.slot_id}",
+            )
+    except Exception as exc:
+        _mark_slot_needs_reconcile_with_owner(db, cloud_slot, **old_owner)
+        raise RuntimeError("当前会话原有 cloud slot 卸载失败，无法重新加载模型") from exc
+
+    try:
+        if _runtime_state_has_loaded_model(edge_state):
+            await unload_runtime_slot(
+                db,
+                edge_slot,
+                reason=f"session {task.edge_session_id} reload edge slot {edge_slot.slot_id}",
+            )
+    except Exception as exc:
+        _mark_slot_needs_reconcile_with_owner(db, edge_slot, **old_owner)
+        _mark_slot_needs_reconcile_with_owner(db, cloud_slot, **old_owner)
+        raise RuntimeError("当前会话原有 edge slot 卸载失败，无法重新加载模型") from exc
+
+    update_runtime_binding(db, old_binding, status="released")
+    _release_non_authoritative_session_bindings(db, task.edge_session_id, keep_binding_id=new_binding.binding_id)
+
+    refreshed_edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == edge_slot.slot_id).first()
+    refreshed_cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == cloud_slot.slot_id).first()
+    return refreshed_edge_slot, refreshed_cloud_slot
+
+
 async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip: str | None = None) -> tuple[RuntimeSlot, bool]:
+    session_cloud_slot = find_active_session_cloud_slot(db, task.edge_session_id or "")
+    if session_cloud_slot is not None:
+        return session_cloud_slot, False
+
     free_slot = get_running_free_cloud_slot(db)
     if free_slot is not None and free_slot.owner_binding_id in {None, task.runtime_binding_id}:
         return free_slot, False
@@ -165,21 +438,49 @@ async def accept_schedule_task(
         .first()
     )
     if existing_active_task is not None:
-        return {
-            "status": "rejected",
-            "task_id": existing_active_task.task_id,
-            "phase": existing_active_task.phase,
-            "phase_progress": existing_active_task.phase_progress,
-            "overall_progress": existing_active_task.overall_progress,
-            "message": "当前会话已有未完成的调度任务，请等待其完成或关闭会话后再发起新的模型加载",
-        }
+        if _models_equal(existing_active_task.model_type, canonical_model_type):
+            return {
+                "status": "rejected",
+                "task_id": existing_active_task.task_id,
+                "phase": existing_active_task.phase,
+                "phase_progress": existing_active_task.phase_progress,
+                "overall_progress": existing_active_task.overall_progress,
+                "message": "当前会话已有相同模型的未完成调度任务，请继续等待该任务完成",
+            }
+        _supersede_active_session_task(
+            db,
+            existing_active_task,
+            new_model_type=canonical_model_type,
+        )
+        logger.info(
+            "同会话模型切换取代未完成任务: session_id=%s old_task_id=%s old_model=%s new_model=%s",
+            edge_session.session_id,
+            existing_active_task.task_id,
+            existing_active_task.model_type,
+            canonical_model_type,
+        )
 
     edge_session.model_type = canonical_model_type
     edge_session = refresh_session_lease(db, edge_session)
 
-    task_id = str(uuid.uuid4())
     edge_device_id = edge_session.edge_device_id
     cloud_device_id = edge_session.cloud_device_id
+    session_binding, session_edge_slot, session_cloud_slot = _get_session_reload_target(db, edge_session.session_id)
+    session_slots_busy = _session_slots_busy_for_new_load(session_edge_slot, session_cloud_slot)
+    if session_slots_busy and session_binding is not None:
+        old_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == session_binding.task_id).first() if session_binding.task_id else None
+        if old_task is not None and _models_equal(old_task.model_type, canonical_model_type):
+            return {
+                "status": "rejected",
+                "task_id": session_binding.task_id,
+                "phase": "loading",
+                "phase_progress": old_task.phase_progress,
+                "overall_progress": old_task.overall_progress,
+                "message": "当前会话相同模型仍在加载或卸载，请继续等待该任务完成",
+            }
+
+    reload_existing_slot = session_binding is not None and session_edge_slot is not None and session_cloud_slot is not None
+    task_id = str(uuid.uuid4())
 
     async with STRATEGY_ADMISSION_LOCK:
         running_strategy_task = find_running_strategy_task(db)
@@ -188,19 +489,33 @@ async def accept_schedule_task(
 
         edge_slot = ensure_runtime_slot(
             db,
-            slot_id=f"edge-slot-{edge_device_id}",
+            slot_id=session_edge_slot.slot_id if session_edge_slot is not None else f"edge-slot-{edge_device_id}",
             role="edge",
             control_url=build_runtime_control_url("edge", edge_session.edge_ip or settings.EDGE_RUNTIME_REAL_HOST or "127.0.0.1"),
         )
-        cloud_slot = ensure_runtime_slot(
-            db,
-            slot_id="cloud-slot-0",
-            role="cloud",
-            process_state="stopped",
-            slot_index=0,
-            spawned_by_scheduler=True,
-            base_env_name=RUNTIME_ENV_FILE,
-        )
+        if session_cloud_slot is not None:
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id=session_cloud_slot.slot_id,
+                role="cloud",
+                control_url=session_cloud_slot.control_url,
+                grpc_target=session_cloud_slot.grpc_target,
+                process_state=session_cloud_slot.process_state,
+                slot_index=session_cloud_slot.slot_index,
+                spawned_by_scheduler=bool(getattr(session_cloud_slot, "spawned_by_scheduler", 0)),
+                base_env_name=session_cloud_slot.base_env_name,
+                process_pid=session_cloud_slot.process_pid,
+            )
+        else:
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                process_state="stopped",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                base_env_name=RUNTIME_ENV_FILE,
+            )
         binding = create_runtime_binding(
             db,
             session_id=edge_session.session_id,
@@ -222,7 +537,7 @@ async def accept_schedule_task(
             phase="strategy",
             phase_progress=0,
             overall_progress=0,
-            message="等待进入切分策略计算队列" if is_queued else "任务已受理，开始计算切分策略",
+            message=("等待进入切分策略计算队列" if is_queued else ("检测到当前会话已有 cloud slot，准备在原 slot 上重新加载模型" if reload_existing_slot else "任务已受理，开始计算切分策略")),
             edge_device_id=edge_device_id,
             cloud_device_id=cloud_device_id,
             edge_status="pending",
@@ -253,7 +568,7 @@ async def accept_schedule_task(
         "phase": "strategy",
         "phase_progress": 0,
         "overall_progress": 0,
-        "message": "等待进入切分策略计算队列" if is_queued else "任务已受理，开始计算切分策略",
+        "message": "等待进入切分策略计算队列" if is_queued else ("检测到当前会话已有 cloud slot，准备在原 slot 上重新加载模型" if reload_existing_slot else "任务已受理，开始计算切分策略"),
     }
 
 
@@ -386,18 +701,46 @@ async def dispatch_loading_task(task_id: str) -> None:
             role="edge",
             control_url=build_runtime_control_url("edge", edge_ip),
         )
-        try:
-            cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task)
-        except Exception as exc:
-            await fail_task_and_promote(db, task, "云端 decode slot 分配失败", str(exc))
-            return
-
         binding = None
         if task.runtime_binding_id:
-            from app.models.models import RuntimeBinding
             binding = db.query(RuntimeBinding).filter(RuntimeBinding.binding_id == task.runtime_binding_id).first()
-            if binding is not None:
-                update_runtime_binding(db, binding, cloud_slot_id=cloud_slot.slot_id)
+
+        session_binding, session_edge_slot, session_cloud_slot = _get_session_reload_target(db, task.edge_session_id or "")
+        reloading_existing_slot = (
+            binding is not None
+            and session_binding is not None
+            and binding.binding_id != session_binding.binding_id
+            and session_edge_slot is not None
+            and session_cloud_slot is not None
+        )
+
+        spawned_cloud_slot = False
+        if reloading_existing_slot:
+            try:
+                edge_slot, cloud_slot = await _reload_session_owned_slots_for_task(
+                    db,
+                    task,
+                    new_binding=binding,
+                    edge_slot=session_edge_slot,
+                    cloud_slot=session_cloud_slot,
+                )
+            except Exception as exc:
+                await fail_task_and_promote(db, task, "当前会话原有 slot 重加载失败", str(exc))
+                return
+        else:
+            try:
+                cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task)
+            except Exception as exc:
+                await fail_task_and_promote(db, task, "云端 decode slot 分配失败", str(exc))
+                return
+
+        if binding is not None:
+            update_runtime_binding(
+                db,
+                binding,
+                edge_slot_id=edge_slot.slot_id,
+                cloud_slot_id=cloud_slot.slot_id,
+            )
 
         update_runtime_slot_state(
             db,
@@ -409,6 +752,10 @@ async def dispatch_loading_task(task_id: str) -> None:
             slot_state="bound",
             model_state="loading",
             process_state="running",
+            active_request_count=0,
+            idle_deadline=None,
+            process_idle_deadline=None,
+            confirmation_status="none",
         )
         update_runtime_slot_state(
             db,
@@ -420,6 +767,9 @@ async def dispatch_loading_task(task_id: str) -> None:
             slot_state="bound",
             model_state="loading",
             process_state="running",
+            active_request_count=0,
+            idle_deadline=None,
+            process_idle_deadline=None,
             confirmation_status="pending",
         )
         task = update_task(
@@ -428,7 +778,7 @@ async def dispatch_loading_task(task_id: str) -> None:
             status="running",
             phase="loading",
             phase_progress=5,
-            message="切分策略计算完成，正在向边云控制入口下发模型启动请求",
+            message="切分策略计算完成，正在向边云控制入口下发模型启动请求" if not reloading_existing_slot else "切分策略计算完成，正在复用当前会话原有 slot 重新加载模型",
             queue_status=LOADING_RUNNING_STATUS,
             queue_position=0,
             edge_status="dispatching",
@@ -493,13 +843,36 @@ async def dispatch_loading_task(task_id: str) -> None:
         )
 
         dispatch_errors: list[str] = []
+        dispatch_exceptions: list[Exception] = []
         for result in results:
             if isinstance(result, Exception):
+                dispatch_exceptions.append(result)
                 dispatch_errors.append(str(result))
                 continue
             if str(result.get("status", "accepted")).strip().lower() not in {"accepted", "ok"}:
                 dispatch_errors.append(json.dumps(result, ensure_ascii=False))
         if dispatch_errors:
+            if _all_dispatch_errors_are_loading_conflicts(dispatch_exceptions):
+                update_task(
+                    db,
+                    task,
+                    status="accepted",
+                    phase="loading",
+                    phase_progress=5,
+                    message="原模型仍在加载，已等待其结束后重新下发新模型加载请求",
+                    queue_status=WAITING_CLOUD_SLOT_STATUS,
+                    queue_position=0,
+                    edge_status="waiting",
+                    cloud_status="waiting",
+                    edge_message="等待原模型加载流程结束",
+                    cloud_message="等待原模型加载流程结束",
+                )
+                logger.info(
+                    "runtime 正在加载旧任务，新任务等待重试下发: task_id=%s errors=%s",
+                    task_id,
+                    " | ".join(dispatch_errors),
+                )
+                return
             if spawned_cloud_slot:
                 await cleanup_spawned_cloud_slot_after_dispatch_failure(db, cloud_slot)
             await fail_task_and_promote(db, task, "切分策略下发失败", " | ".join(dispatch_errors))
@@ -569,6 +942,9 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
         if not task:
             logger.error("后台任务启动失败，未找到调度任务: %s", task_id)
             return
+        if task.status in TASK_TERMINAL_STATUSES:
+            logger.info("调度任务已处于终态，跳过后台处理: task_id=%s status=%s", task_id, task.status)
+            return
 
         raw_model_type = trigger_payload["model_type"]
         model_type_key = resolve_model_type_key(raw_model_type)
@@ -608,6 +984,14 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
                 task,
                 "初始化会话不存在",
                 f"未找到 session_id={edge_session_id} 对应的有效会话",
+            )
+            return
+        if edge_session.model_type and not _models_equal(edge_session.model_type, model_type):
+            await fail_task_and_promote(
+                db,
+                task,
+                "模型加载任务已被新的模型请求取代",
+                f"session_model={edge_session.model_type}, task_model={model_type}",
             )
             return
 

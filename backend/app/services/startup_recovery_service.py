@@ -83,6 +83,40 @@ def _release_binding(binding: RuntimeBinding | None) -> None:
     binding.updated_at = datetime.utcnow()
 
 
+def _authoritative_binding_id_by_session(db: Session) -> dict[str, str]:
+    session_owner_binding: dict[str, str] = {}
+    session_owner_score: dict[str, tuple[int, datetime, str]] = {}
+    slots = db.query(RuntimeSlot).filter(RuntimeSlot.owner_session_id.isnot(None), RuntimeSlot.owner_binding_id.isnot(None)).all()
+    for slot in slots:
+        session_id = slot.owner_session_id
+        binding_id = slot.owner_binding_id
+        if not session_id or not binding_id:
+            continue
+        score = 2 if slot.slot_state == 'bound' and slot.model_state == 'ready' else 1 if slot.slot_state == 'bound' else 0
+        updated_at = slot.updated_at or datetime.min
+        candidate = (score, updated_at, binding_id)
+        current = session_owner_score.get(session_id)
+        if current is None or candidate > current:
+            session_owner_score[session_id] = candidate
+            session_owner_binding[session_id] = binding_id
+    return session_owner_binding
+
+
+def _release_duplicate_session_bindings(db: Session) -> None:
+    authoritative = _authoritative_binding_id_by_session(db)
+    bindings = db.query(RuntimeBinding).filter(RuntimeBinding.status == 'binding').all()
+    updated = False
+    for binding in bindings:
+        keep_binding_id = authoritative.get(binding.session_id)
+        if keep_binding_id is None or binding.binding_id == keep_binding_id:
+            continue
+        _release_binding(binding)
+        db.add(binding)
+        updated = True
+    if updated:
+        db.flush()
+
+
 def _binding_should_release(
     *,
     task: ScheduleTask | None,
@@ -124,6 +158,7 @@ def recover_runtime_ownership_on_startup(db: Session) -> None:
             _release_binding(binding)
 
     db.flush()
+    _release_duplicate_session_bindings(db)
 
     slots = db.query(RuntimeSlot).all()
     for slot in slots:
@@ -151,6 +186,7 @@ def recover_runtime_ownership_on_startup(db: Session) -> None:
 
 
 def reconcile_runtime_ownership(db: Session) -> None:
+    _release_duplicate_session_bindings(db)
     slots = db.query(RuntimeSlot).all()
     for slot in slots:
         binding = _get_binding(db, slot.owner_binding_id)
