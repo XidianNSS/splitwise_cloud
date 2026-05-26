@@ -22,7 +22,6 @@ class PrometheusMetricsCache:
         entry = self._cache.get(key)
         if not entry:
             return None
-
         metrics, ts = entry
         if time.monotonic() - ts > self.ttl_seconds:
             self._cache.pop(key, None)
