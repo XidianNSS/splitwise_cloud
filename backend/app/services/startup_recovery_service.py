@@ -102,6 +102,29 @@ def _authoritative_binding_id_by_session(db: Session) -> dict[str, str]:
     return session_owner_binding
 
 
+def _task_is_active_for_binding(task: ScheduleTask | None) -> bool:
+    return task is not None and task.status in _ACTIVE_TASK_STATUSES and task.queue_status != 'done'
+
+
+def _task_is_superseded(task: ScheduleTask | None) -> bool:
+    return bool(task is not None and task.status == 'failed' and str(task.error_detail or '').startswith('superseded_by_model='))
+
+
+def _session_has_active_replacement_task(db: Session, session_id: str | None) -> bool:
+    if not session_id:
+        return False
+    return (
+        db.query(ScheduleTask)
+        .filter(
+            ScheduleTask.edge_session_id == session_id,
+            ScheduleTask.status.in_(list(_ACTIVE_TASK_STATUSES)),
+            ScheduleTask.queue_status != 'done',
+        )
+        .first()
+        is not None
+    )
+
+
 def _release_duplicate_session_bindings(db: Session) -> None:
     authoritative = _authoritative_binding_id_by_session(db)
     bindings = db.query(RuntimeBinding).filter(RuntimeBinding.status == 'binding').all()
@@ -109,6 +132,8 @@ def _release_duplicate_session_bindings(db: Session) -> None:
     for binding in bindings:
         keep_binding_id = authoritative.get(binding.session_id)
         if keep_binding_id is None or binding.binding_id == keep_binding_id:
+            continue
+        if _task_is_active_for_binding(_get_task(db, binding.task_id)):
             continue
         _release_binding(binding)
         db.add(binding)
@@ -199,6 +224,9 @@ def reconcile_runtime_ownership(db: Session) -> None:
         binding_released = binding is not None and binding.status == 'released'
         session_finished = session is not None and session.status in _FINISHED_SESSION_STATUSES
         task_failed = task is not None and task.status in {'failed'}
+
+        if task_failed and _task_is_superseded(task) and _session_has_active_replacement_task(db, slot.owner_session_id):
+            continue
 
         if binding_missing or session_missing or task_missing or binding_released or session_finished or task_failed:
             if binding is not None:

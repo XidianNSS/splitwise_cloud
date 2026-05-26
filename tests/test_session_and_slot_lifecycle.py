@@ -1073,10 +1073,18 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         self._create_session()
         db = SessionLocal()
         try:
+            old_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-active",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
             task = ScheduleTask(
                 task_id="task-active",
                 openwebui_user_id="user-1",
                 edge_session_id="session-1",
+                runtime_binding_id=old_binding.binding_id,
                 model_type="Llama-3.2-3B",
                 status="running",
                 phase="loading",
@@ -1122,10 +1130,12 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             old_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-active").first()
             new_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload["task_id"]).first()
             session = db.query(EdgeSession).filter(EdgeSession.session_id == "session-1").first()
+            old_binding = db.query(RuntimeBinding).filter(RuntimeBinding.task_id == "task-active").first()
             self.assertEqual(old_task.status, "failed")
             self.assertIn("取代", old_task.message)
             self.assertEqual(new_task.model_type, "Llama-3.2-3B-Instruct")
             self.assertEqual(session.model_type, "Llama-3.2-3B-Instruct")
+            self.assertEqual(old_binding.status, "binding")
         finally:
             db.close()
 
@@ -1561,9 +1571,15 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         db = SessionLocal()
         try:
             task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-wait-dispatch").first()
+            edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "edge-slot-edge_A").first()
+            cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "cloud-slot-0").first()
             self.assertEqual(task.status, "accepted")
             self.assertEqual(task.queue_status, "waiting_cloud_slot")
             self.assertIn("等待", task.message)
+            self.assertIsNone(edge_slot.owner_binding_id)
+            self.assertIsNone(edge_slot.task_id)
+            self.assertIsNone(cloud_slot.owner_binding_id)
+            self.assertIsNone(cloud_slot.task_id)
         finally:
             db.close()
 

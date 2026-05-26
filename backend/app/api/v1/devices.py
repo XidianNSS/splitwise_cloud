@@ -42,30 +42,38 @@ async def delete_device(device_id: str, admin_user: User = Depends(get_current_a
 async def get_prometheus_targets(job_type: str, db: Session = Depends(get_db)):
     """
     Prometheus 会定时拉取这个接口。
-    job_type 可以是 'node' (查 9100) 或 'gpu' (查 9400)
+    job_type 支持：
+    - node: node_exporter，默认端口 9100
+    - gpu: dcgm_exporter，默认端口 9400
+    - npu: ascend-npu-exporter，默认端口 9500
     """
+    target_ports = {
+        "node": ":9100",
+        "gpu": ":9400",
+        "npu": ":9500",
+    }
+    target_port = target_ports.get(job_type)
+    if target_port is None:
+        raise HTTPException(status_code=400, detail="job_type 仅支持 node/gpu/npu")
+
     devices = db.query(Device).all()
     targets_list = []
 
     for dev in devices:
-        # 解析数据库中 10.x.x.x:9100|10.x.x.x:9400 的格式
-        endpoints = dev.value.split('|')
-        target_ip_port = None
-
-        for ep in endpoints:
-            if job_type == "node" and ":9100" in ep:
-                target_ip_port = ep
-            elif job_type == "gpu" and ":9400" in ep:
-                target_ip_port = ep
+        endpoints = [endpoint.strip() for endpoint in dev.value.split('|') if endpoint.strip()]
+        target_ip_port = next((endpoint for endpoint in endpoints if target_port in endpoint), None)
 
         if target_ip_port:
-            # 组装成 Prometheus 要求的 HTTP SD JSON 格式
+            labels = {
+                "device_id": dev.id,
+                "device_name": dev.name,
+            }
+            if job_type == "npu":
+                labels["accelerator_type"] = "ascend"
+
             targets_list.append({
                 "targets": [target_ip_port],
-                "labels": {
-                    "device_id": dev.id,  # 比如 edge_A
-                    "device_name": dev.name  # 比如 📱 边缘节点 A
-                }
+                "labels": labels,
             })
 
     return targets_list
