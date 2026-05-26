@@ -19,14 +19,7 @@ scrape_configs:
         refresh_interval: 15s
 
   - job_name: 'npu-metrics'
-    # 昇腾 NPU exporter，方案 4 暂用 static_configs；新增昇腾设备时追加 target
-    static_configs:
-      - targets: ['10.144.144.4:9500']
-        labels:
-          accelerator_type: ascend
-
-  - job_name: 'npu-metrics'
-    # 动态向你的 FastAPI 后端请求 ascend-npu-exporter (9500) 的列表
+    # 动态向 FastAPI 后端请求 ascend-npu-exporter (9500) 的列表
     http_sd_configs:
       - url: 'http://10.144.144.2:8010/api/v1/system/devices/prometheus/targets/npu'
         refresh_interval: 15s

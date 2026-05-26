@@ -1023,7 +1023,7 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         self.assertEqual(queue_payload[0]["queue_status"], "waiting_cloud_slot")
         self.assertEqual(queue_payload[0]["runtime_binding_id"], bindings_payload[0]["binding_id"])
 
-    def test_same_session_cannot_accept_second_active_task(self) -> None:
+    def test_same_session_rejects_same_model_second_active_task(self) -> None:
         self._create_session()
         db = SessionLocal()
         try:
@@ -1067,7 +1067,77 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "rejected")
         self.assertEqual(payload["task_id"], "task-active")
-        self.assertIn("未完成", payload["message"])
+        self.assertIn("相同模型", payload["message"])
+
+    def test_same_session_model_switch_supersedes_active_task(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            old_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-active",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task = ScheduleTask(
+                task_id="task-active",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id=old_binding.binding_id,
+                model_type="Llama-3.2-3B",
+                status="running",
+                phase="loading",
+                phase_progress=30,
+                overall_progress=65,
+                message="already running",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=30,
+                cloud_progress=30,
+                edge_status="loading",
+                cloud_status="loading",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_message="loading",
+                cloud_message="loading",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        with patch("app.services.schedule_orchestrator.process_schedule_task", new=AsyncMock()) as process_mock:
+            response = self.client.post(
+                "/api/v1/schedule/trigger",
+                headers={
+                    "Authorization": "Bearer dev-token",
+                    "Session-Id": "session-1",
+                },
+                json={"model_type": "Llama-3.2-3B-Instruct"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.json()
+        self.assertEqual(payload["status"], "accepted")
+        self.assertNotEqual(payload["task_id"], "task-active")
+        process_mock.assert_called_once()
+
+        db = SessionLocal()
+        try:
+            old_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-active").first()
+            new_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload["task_id"]).first()
+            session = db.query(EdgeSession).filter(EdgeSession.session_id == "session-1").first()
+            old_binding = db.query(RuntimeBinding).filter(RuntimeBinding.task_id == "task-active").first()
+            self.assertEqual(old_task.status, "failed")
+            self.assertIn("取代", old_task.message)
+            self.assertEqual(new_task.model_type, "Llama-3.2-3B-Instruct")
+            self.assertEqual(session.model_type, "Llama-3.2-3B-Instruct")
+            self.assertEqual(old_binding.status, "binding")
+        finally:
+            db.close()
 
 
     def test_decode_process_manager_derives_env_from_backend_env_file(self) -> None:
@@ -1282,6 +1352,399 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             self.assertEqual(slot.grpc_target, "127.0.0.1:52164")
             self.assertEqual(slot.process_pid, 43210)
             self.assertEqual(int(slot.spawned_by_scheduler), 1)
+        finally:
+            db.close()
+
+    def test_same_session_reload_reuses_existing_cloud_slot(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            old_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-old",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:19113/load_strategy",
+                grpc_target="127.0.0.1:52163",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                process_state="running",
+                process_pid=12345,
+                base_env_name=".env.wyy",
+            )
+            update_runtime_slot_state(
+                db,
+                edge_slot,
+                slot_state="bound",
+                model_state="ready",
+                owner_session_id="session-1",
+                owner_binding_id=old_binding.binding_id,
+                task_id="task-old",
+                model_type="Llama-3.2-3B-Instruct",
+                process_state="running",
+            )
+            update_runtime_slot_state(
+                db,
+                cloud_slot,
+                slot_state="bound",
+                model_state="ready",
+                owner_session_id="session-1",
+                owner_binding_id=old_binding.binding_id,
+                task_id="task-old",
+                model_type="Llama-3.2-3B-Instruct",
+                process_state="running",
+                confirmation_status="passed",
+                process_idle_deadline=datetime.utcnow() + timedelta(minutes=5),
+            )
+            new_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-reload",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task = ScheduleTask(
+                task_id="task-reload",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id=new_binding.binding_id,
+                model_type="Llama-3.2-3B-Instruct",
+                status="accepted",
+                phase="loading",
+                phase_progress=0,
+                overall_progress=0,
+                message="reload",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=0,
+                cloud_progress=0,
+                edge_status="pending",
+                cloud_status="pending",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                allocated_cloud_slot_id="cloud-slot-0",
+                edge_message="pending",
+                cloud_message="pending",
+                strategy_payload='{"layer_partitions": []}',
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        async def fake_fetch_runtime_state(slot):
+            return {
+                "ready": True,
+                "draining": False,
+                "task_id": slot.task_id or "task-old",
+                "model_type": "Llama-3.2-3B-Instruct",
+                "active_request_count": 0,
+            }
+
+        async def fake_unload_runtime_slot(db, slot, *, reason, timeout=10.0):
+            del reason, timeout
+            update_runtime_slot_state(
+                db,
+                slot,
+                slot_state="free",
+                model_state="empty",
+                owner_session_id=None,
+                owner_binding_id=None,
+                model_type=None,
+                task_id=None,
+                active_request_count=0,
+                confirmation_status="none",
+                idle_deadline=None,
+                process_idle_deadline=None,
+                last_used_at=datetime.utcnow(),
+            )
+            return {"unloaded": True}
+
+        import asyncio
+        with (
+            patch("app.services.schedule_orchestrator.fetch_runtime_state", new=AsyncMock(side_effect=fake_fetch_runtime_state)),
+            patch("app.services.schedule_orchestrator.unload_runtime_slot", new=AsyncMock(side_effect=fake_unload_runtime_slot)),
+            patch("app.services.schedule_orchestrator.dispatch_strategy_to_runtime", new=AsyncMock(return_value={"status": "accepted"})),
+            patch("app.services.schedule_orchestrator.start_decode_server_process_locked", new=AsyncMock()) as start_mock,
+        ):
+            asyncio.run(dispatch_loading_task("task-reload"))
+
+        start_mock.assert_not_called()
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-reload").first()
+            old_binding = db.query(RuntimeBinding).filter(RuntimeBinding.task_id == "task-old").first()
+            new_binding = db.query(RuntimeBinding).filter(RuntimeBinding.task_id == "task-reload").first()
+            cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "cloud-slot-0").first()
+            self.assertIsNotNone(task)
+            self.assertEqual(task.cloud_slot_id, "cloud-slot-0")
+            self.assertEqual(task.allocated_cloud_slot_id, "cloud-slot-0")
+            self.assertEqual(task.spawned_cloud_slot, None)
+            self.assertEqual(task.status, "running")
+            self.assertIsNotNone(old_binding)
+            self.assertEqual(old_binding.status, "released")
+            self.assertIsNotNone(new_binding)
+            self.assertEqual(new_binding.status, "binding")
+            self.assertIsNotNone(cloud_slot)
+            self.assertEqual(cloud_slot.owner_binding_id, new_binding.binding_id)
+            self.assertIsNone(cloud_slot.process_idle_deadline)
+        finally:
+            db.close()
+
+    def test_dispatch_loading_waits_when_runtime_is_still_loading_previous_task(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-wait-dispatch",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:19113/load_strategy",
+                grpc_target="127.0.0.1:52163",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                process_state="running",
+            )
+            update_runtime_slot_state(db, edge_slot, slot_state="free", model_state="empty", process_state="running")
+            update_runtime_slot_state(db, cloud_slot, slot_state="free", model_state="empty", process_state="running")
+            task = ScheduleTask(
+                task_id="task-wait-dispatch",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id=binding.binding_id,
+                model_type="Llama-3.2-3B-Instruct",
+                status="accepted",
+                phase="loading",
+                phase_progress=0,
+                overall_progress=0,
+                message="dispatch",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=0,
+                cloud_progress=0,
+                edge_status="pending",
+                cloud_status="pending",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                allocated_cloud_slot_id="cloud-slot-0",
+                edge_message="pending",
+                cloud_message="pending",
+                strategy_payload='{"layer_partitions": []}',
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        import asyncio
+        import httpx
+        request = httpx.Request("POST", "http://runtime/load_strategy")
+        response = httpx.Response(409, request=request, json={"detail": "runtime loading already in progress"})
+        conflict = httpx.HTTPStatusError("conflict", request=request, response=response)
+
+        with patch("app.services.schedule_orchestrator.dispatch_strategy_to_runtime", new=AsyncMock(side_effect=[conflict, conflict])):
+            asyncio.run(dispatch_loading_task("task-wait-dispatch"))
+
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-wait-dispatch").first()
+            edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "edge-slot-edge_A").first()
+            cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == "cloud-slot-0").first()
+            self.assertEqual(task.status, "accepted")
+            self.assertEqual(task.queue_status, "waiting_cloud_slot")
+            self.assertIn("等待", task.message)
+            self.assertIsNone(edge_slot.owner_binding_id)
+            self.assertIsNone(edge_slot.task_id)
+            self.assertIsNone(cloud_slot.owner_binding_id)
+            self.assertIsNone(cloud_slot.task_id)
+        finally:
+            db.close()
+
+    def test_same_session_reload_rejects_when_runtime_is_busy(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            old_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-old",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            edge_slot = ensure_runtime_slot(db, slot_id="edge-slot-edge_A", role="edge", control_url="http://127.0.0.1:19112/load_strategy")
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:19113/load_strategy",
+                grpc_target="127.0.0.1:52163",
+                slot_index=0,
+                spawned_by_scheduler=True,
+                process_state="running",
+            )
+            update_runtime_slot_state(db, edge_slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=old_binding.binding_id, task_id="task-old", model_type="Llama-3.2-3B-Instruct", process_state="running")
+            update_runtime_slot_state(db, cloud_slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=old_binding.binding_id, task_id="task-old", model_type="Llama-3.2-3B-Instruct", process_state="running", confirmation_status="passed")
+            new_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-reload-busy",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            task = ScheduleTask(
+                task_id="task-reload-busy",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id=new_binding.binding_id,
+                model_type="Llama-3.2-3B-Instruct",
+                status="accepted",
+                phase="loading",
+                phase_progress=0,
+                overall_progress=0,
+                message="reload",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=0,
+                cloud_progress=0,
+                edge_status="pending",
+                cloud_status="pending",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                allocated_cloud_slot_id="cloud-slot-0",
+                edge_message="pending",
+                cloud_message="pending",
+                strategy_payload='{"layer_partitions": []}',
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(task)
+            db.commit()
+        finally:
+            db.close()
+
+        async def busy_runtime_state(_slot):
+            return {
+                "ready": True,
+                "draining": False,
+                "task_id": "task-old",
+                "model_type": "Llama-3.2-3B-Instruct",
+                "active_request_count": 1,
+            }
+
+        import asyncio
+        with (
+            patch("app.services.schedule_orchestrator.fetch_runtime_state", new=AsyncMock(side_effect=busy_runtime_state)),
+            patch("app.services.schedule_orchestrator.unload_runtime_slot", new=AsyncMock()) as unload_mock,
+            patch("app.services.schedule_orchestrator.start_decode_server_process_locked", new=AsyncMock()) as start_mock,
+        ):
+            asyncio.run(dispatch_loading_task("task-reload-busy"))
+
+        unload_mock.assert_not_called()
+        start_mock.assert_not_called()
+        db = SessionLocal()
+        try:
+            task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-reload-busy").first()
+            self.assertIsNotNone(task)
+            self.assertEqual(task.status, "failed")
+            self.assertIn("当前会话原有 slot 重加载失败", task.message)
+        finally:
+            db.close()
+
+    def test_reconcile_runtime_ownership_releases_duplicate_session_bindings(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            db.add_all([
+                ScheduleTask(
+                    task_id="task-keep",
+                    openwebui_user_id="user-1",
+                    edge_session_id="session-1",
+                    runtime_binding_id="binding-placeholder",
+                    model_type="Llama-3.2-3B-Instruct",
+                    status="completed",
+                    phase="completed",
+                    queue_status="done",
+                    edge_slot_id="edge-slot-edge_A",
+                    cloud_slot_id="cloud-slot-0",
+                    edge_device_id="edge_A",
+                    cloud_device_id="cloud",
+                    edge_status="ready",
+                    cloud_status="ready",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                ),
+                ScheduleTask(
+                    task_id="task-dup",
+                    openwebui_user_id="user-1",
+                    edge_session_id="session-1",
+                    runtime_binding_id="binding-placeholder-2",
+                    model_type="Llama-3.2-3B-Instruct",
+                    status="completed",
+                    phase="completed",
+                    queue_status="done",
+                    edge_slot_id="edge-slot-edge_A",
+                    cloud_slot_id="cloud-slot-1",
+                    edge_device_id="edge_A",
+                    cloud_device_id="cloud",
+                    edge_status="ready",
+                    cloud_status="ready",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                ),
+            ])
+            db.commit()
+            keep_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-keep",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            duplicate_binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-dup",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-1",
+            )
+            keep_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-keep").first()
+            dup_task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-dup").first()
+            keep_task.runtime_binding_id = keep_binding.binding_id
+            dup_task.runtime_binding_id = duplicate_binding.binding_id
+            db.add(keep_task)
+            db.add(dup_task)
+            slot = ensure_runtime_slot(db, slot_id="cloud-slot-0", role="cloud", control_url="http://127.0.0.1:19113/load_strategy", spawned_by_scheduler=True, process_state="running")
+            update_runtime_slot_state(db, slot, slot_state="bound", model_state="ready", owner_session_id="session-1", owner_binding_id=keep_binding.binding_id, task_id="task-keep", confirmation_status="passed")
+            reconcile_runtime_ownership(db)
+            db.refresh(keep_binding)
+            db.refresh(duplicate_binding)
+            self.assertEqual(keep_binding.status, "binding")
+            self.assertEqual(duplicate_binding.status, "released")
         finally:
             db.close()
 

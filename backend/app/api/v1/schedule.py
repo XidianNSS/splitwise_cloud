@@ -186,9 +186,25 @@ async def confirm_cloud_runtime_integrity(
     if cloud_slot is None or edge_slot is None:
         raise HTTPException(status_code=409, detail="任务对应的 runtime slot 不完整")
 
+    logger.info(
+        "Received cloud confirmation: task_id=%s cloud_slot_id=%s allocated_cloud_slot_id=%s edge_slot_id=%s",
+        payload.task_id,
+        payload.cloud_slot_id,
+        cloud_slot_id,
+        edge_slot_id,
+    )
     matched, reason = await forward_cloud_confirmation_to_edge(
         edge_slot=edge_slot,
         payload=payload,
+    )
+
+    logger.info(
+        "Cloud confirmation result: task_id=%s cloud_slot_id=%s edge_slot_id=%s matched=%s reason=%s",
+        payload.task_id,
+        cloud_slot_id,
+        edge_slot_id,
+        matched,
+        reason,
     )
 
     if matched:
