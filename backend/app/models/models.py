@@ -95,12 +95,24 @@ def init_db_data():
     if not db.query(Device).first():
         logger.info("🛠️ 首次启动：正在向数据库注入默认物理设备资产...")
         db.add_all([
-            Device(id="cloud", name="☁️ 云端总枢纽 (RTX 5090)", value="10.144.144.2:9400|10.144.144.2:9100",
-                   device_type="cloud"),
-            Device(id="edge_A", name="📱 边缘节点 A (RTX 4090)", value="10.144.144.3:9100|10.144.144.3:9400",
-                   device_type="edge"),
-            Device(id="edge_B", name="📱 边缘节点 B (RTX 3080)", value="10.144.144.4:9100|10.144.144.4:9400",
-                   device_type="edge")
+            Device(
+            id="cloud",
+            name="☁️ 云端总枢纽 (Ascend NPU)",
+            value="10.144.144.4:9100|10.144.144.4:9500",
+            device_type="cloud",
+        ),
+        Device(
+            id="edge_A",
+            name="📱 边缘节点 A",
+            value="10.144.144.5:9100|10.144.144.5:9400",
+            device_type="edge",
+        ),
+            # Device(id="cloud", name="☁️ 云端总枢纽 (RTX 5090)", value="10.144.144.2:9400|10.144.144.2:9100",
+            #        device_type="cloud"),
+            # Device(id="edge_A", name="📱 边缘节点 A (RTX 4090)", value="10.144.144.3:9100|10.144.144.3:9400",
+            #        device_type="edge"),
+            # Device(id="edge_B", name="📱 边缘节点 B (RTX 3080)", value="10.144.144.4:9100|10.144.144.4:9400",
+            #        device_type="edge")
         ])
         db.commit()
 

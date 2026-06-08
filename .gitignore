@@ -5,6 +5,7 @@ __pycache__/
 # 虚拟环境 (绝对不能传到 Git！)
 venv/
 .venv/
+.python/
 
 # 配置文件
 backend/.env
