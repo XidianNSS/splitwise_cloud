@@ -54,7 +54,7 @@ class Settings:
     CLOUD_RUNTIME_MOCK_PORT: int = int(os.getenv("CLOUD_RUNTIME_MOCK_PORT", os.getenv("CLOUD_RUNTIME_PORT", "18002")))
     MODEL_STARTUP_RESOURCE_CHECK_ENABLED: bool = env_bool("MODEL_STARTUP_RESOURCE_CHECK_ENABLED", True)
     MODEL_STARTUP_MAX_MEMORY_PERCENT: float = float(os.getenv("MODEL_STARTUP_MAX_MEMORY_PERCENT", 95.0))
-    MODELSPLIT_DEV_ROOT: str = os.getenv("MODELSPLIT_DEV_ROOT", "/home/nss-d/wyy/ModelSplit_dev")
+    MODELSPLIT_DEV_ROOT: str = os.getenv("MODELSPLIT_DEV_ROOT", "/home/wyy/workspace/ModelSplit")
     CLOUD_SLOT_HTTP_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_HTTP_BASE_PORT", "19113"))
     CLOUD_SLOT_GRPC_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_GRPC_BASE_PORT", "52163"))
     CLOUD_SLOT_MAX_COUNT: int = int(os.getenv("CLOUD_SLOT_MAX_COUNT", "4"))
@@ -88,6 +88,15 @@ class Settings:
     NETWORK_PROBE_CACHE_SECONDS: float = float(os.getenv("NETWORK_PROBE_CACHE_SECONDS", 30.0))
     NETWORK_MAX_CONCURRENT_PROBES: int = int(os.getenv("NETWORK_MAX_CONCURRENT_PROBES", 5))
     FRONTEND_DIR: Path = PROJECT_ROOT / "frontend"
+
+    MODELSPLIT_PYTHON_BIN: str = os.getenv(
+        "MODELSPLIT_PYTHON_BIN",
+        "/home/miniconda3/envs/modelsplit/bin/python",
+    )
+    ASCEND_ENV_SCRIPT: str = os.getenv(
+        "ASCEND_ENV_SCRIPT",
+        "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    )
 
 
 settings = Settings()

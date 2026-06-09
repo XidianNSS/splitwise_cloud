@@ -53,6 +53,8 @@ def _mark_managed_cloud_slot_stopped(db: Session, slot: RuntimeSlot) -> RuntimeS
     fields.update({
         "process_state": "stopped",
         "process_pid": None,
+        "control_url": None,
+        "grpc_target": None,
     })
     return update_runtime_slot_state(db, slot, **fields)
 

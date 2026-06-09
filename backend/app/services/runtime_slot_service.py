@@ -151,15 +151,28 @@ def _extract_port_from_grpc_target(grpc_target: str | None) -> int | None:
         return None
 
 
-def collect_allocated_cloud_ports(db: Session) -> tuple[set[int], set[int]]:
+def collect_allocated_cloud_ports(
+    db: Session,
+    *,
+    exclude_slot_id: str | None = None,
+) -> tuple[set[int], set[int]]:
     http_ports: set[int] = set()
     grpc_ports: set[int] = set()
-    slots = db.query(RuntimeSlot).filter(RuntimeSlot.role == "cloud").all()
+
+    query = db.query(RuntimeSlot).filter(RuntimeSlot.role == "cloud")
+    if exclude_slot_id:
+        query = query.filter(RuntimeSlot.slot_id != exclude_slot_id)
+
+    slots = query.all()
     for slot in slots:
+        if slot.process_state not in {"running", "starting"}:
+            continue
+
         http_port = _extract_port_from_control_url(slot.control_url)
         grpc_port = _extract_port_from_grpc_target(slot.grpc_target)
         if http_port is not None:
             http_ports.add(http_port)
         if grpc_port is not None:
             grpc_ports.add(grpc_port)
+
     return http_ports, grpc_ports

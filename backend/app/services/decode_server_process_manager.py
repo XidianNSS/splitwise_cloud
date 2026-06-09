@@ -44,10 +44,13 @@ def _choose_available_port(start_port: int, *, reserved_ports: set[int] | None =
     return candidate
 
 
-def allocate_cloud_slot_ports(slot_index: int) -> tuple[int, int]:
+def allocate_cloud_slot_ports(slot_index: int, *, slot_id: str | None = None) -> tuple[int, int]:
     db = SessionLocal()
     try:
-        reserved_http_ports, reserved_grpc_ports = collect_allocated_cloud_ports(db)
+        reserved_http_ports, reserved_grpc_ports = collect_allocated_cloud_ports(
+            db,
+            exclude_slot_id=slot_id,
+        )
     finally:
         db.close()
     http_port = _choose_available_port(
@@ -72,7 +75,7 @@ def current_runtime_env_metadata() -> tuple[str, str]:
 
 
 def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> DecodeSlotProcessInfo:
-    http_port, grpc_port = allocate_cloud_slot_ports(slot_index)
+    http_port, grpc_port = allocate_cloud_slot_ports(slot_index, slot_id=slot_id)
     advertised_host = settings.CLOUD_RUNTIME_REAL_HOST or "127.0.0.1"
     control_url = f"http://{advertised_host}:{http_port}/load_strategy"
     grpc_target = f"{advertised_host}:{grpc_port}"
@@ -90,8 +93,15 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         "DECODE_GRPC_BIND": f"0.0.0.0:{grpc_port}",
         "DECODE_GRPC_TARGET": grpc_target,
     })
-    python_bin = "/home/nss-d/anaconda3/envs/modelsplit/bin/python"
+    python_bin = settings.MODELSPLIT_PYTHON_BIN
+    ascend_env_script = settings.ASCEND_ENV_SCRIPT
+
+    source_ascend_env = ""
+    if ascend_env_script:
+        source_ascend_env = f"source {shlex.quote(ascend_env_script)} && "
+
     command = (
+        f"{source_ascend_env}"
         f"cd {shlex.quote(settings.MODELSPLIT_DEV_ROOT)} && "
         f"{shlex.quote(python_bin)} -m app.services.decode_server.app"
     )
