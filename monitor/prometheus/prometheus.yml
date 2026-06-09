@@ -9,11 +9,16 @@ scrape_configs:
           - "127.0.0.1:9091"
 
   - job_name: "node-metrics"
-    static_configs:
-      - targets:
-          - "10.144.144.4:9100"
-        labels:
-          device_id: "cloud"
-          device_name: "cloud-node"
-          device_type: "cloud"
-          exporter_type: "node_exporter"
+    http_sd_configs:
+      - url: "http://127.0.0.1:8010/api/v1/system/devices/prometheus/targets/node"
+        refresh_interval: 30s
+
+  - job_name: "gpu-metrics"
+    http_sd_configs:
+      - url: "http://127.0.0.1:8010/api/v1/system/devices/prometheus/targets/gpu"
+        refresh_interval: 30s
+
+  - job_name: "npu-metrics"
+    http_sd_configs:
+      - url: "http://127.0.0.1:8010/api/v1/system/devices/prometheus/targets/npu"
+        refresh_interval: 30s

@@ -63,7 +63,7 @@ class Settings:
     RUNTIME_CONFIRMATION_PATH: str = os.getenv("RUNTIME_CONFIRMATION_PATH", "/api/v1/runtime/confirmation/cloud")
     RUNTIME_CONFIRMATION_FORWARD_TIMEOUT_SECONDS: float = float(os.getenv("RUNTIME_CONFIRMATION_FORWARD_TIMEOUT_SECONDS", "30"))
 
-    PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.4:9090")
+    PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.4:9091")
     ALGORITHM_USE_MOCK: bool = env_bool("ALGORITHM_USE_MOCK", False)
     ALGORITHM_REAL_API_URL: str = os.getenv("ALGORITHM_REAL_API_URL", "http://127.0.0.1:8050/infer")
     ALGORITHM_MOCK_API_URL: str = os.getenv("ALGORITHM_MOCK_API_URL", "http://127.0.0.1:5000/infer")
