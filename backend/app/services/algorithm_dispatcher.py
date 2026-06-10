@@ -12,8 +12,14 @@ DEFAULT_PROMPT_LEN = 96
 
 
 def normalize_device_runtime_label(metrics: dict) -> str:
-    gpu_mem_total_mb = float(metrics.get("gpu_mem_total_mb", 0.0) or 0.0)
-    return "cuda:0" if gpu_mem_total_mb > 1.0 else "cpu"
+    total_mb = float(metrics.get("gpu_mem_total_mb", 0.0) or 0.0)
+    if total_mb <= 1.0:
+        return "cpu"
+
+    if metrics.get("accelerator_type") == "ascend":
+        return "npu:0"
+
+    return "cuda:0"
 
 
 def build_algorithm_request_payload(

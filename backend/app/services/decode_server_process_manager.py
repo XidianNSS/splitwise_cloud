@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 import shlex
@@ -28,6 +29,7 @@ class DecodeSlotProcessInfo:
 
 _SLOT_PROCESSES: dict[str, subprocess.Popen] = {}
 _SLOT_PROCESS_LOCK = asyncio.Lock()
+logger = logging.getLogger("DecodeServerProcessManager")
 
 
 def _port_in_use(port: int) -> bool:
@@ -73,6 +75,53 @@ def current_runtime_env_metadata() -> tuple[str, str]:
     app_env = "prod" if env_file_name == ".env.prod" else ("wyy" if env_file_name == ".env.wyy" else env.get("APP_ENV", "prod"))
     return app_env, env_file_name or env.get("ENV_FILE", ".env")
 
+def _normalize_slot_model_device(raw_device: str) -> str:
+    value = (raw_device or "").strip().lower()
+    if not value:
+        return ""
+
+    if value == "cpu":
+        return "cpu"
+
+    if value.startswith(("npu:", "cuda:")):
+        return value
+
+    # CLOUD_SLOT_NPU_DEVICES=0,1 时自动解释成 npu:0,npu:1
+    if value.isdigit():
+        return f"npu:{value}"
+
+    # 兼容写成 ascend:0 的情况，内部统一给 ModelSplit 使用 npu:0
+    if value.startswith("ascend:"):
+        return "npu:" + value.split(":", 1)[1]
+
+    raise ValueError(f"非法 CLOUD_SLOT_NPU_DEVICES 设备项: {raw_device!r}")
+
+
+def _configured_fallback_model_device() -> str:
+    # 优先用已经加载进 os.environ 的 MODEL_DEVICE。
+    # ModelSplit 子进程会继承这个变量；如果本函数按 slot 注入了 MODEL_DEVICE，
+    # 由于 ModelSplit load_dotenv 默认不覆盖已有环境变量，所以子进程注入值优先。
+    return (os.environ.get("MODEL_DEVICE") or "").strip()
+
+
+def _model_device_for_cloud_slot(slot_index: int) -> str:
+    devices = settings.CLOUD_SLOT_NPU_DEVICES
+
+    if not devices:
+        return _normalize_slot_model_device(_configured_fallback_model_device())
+
+    if slot_index < len(devices):
+        return _normalize_slot_model_device(devices[slot_index])
+
+    if settings.CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION:
+        return _normalize_slot_model_device(devices[slot_index % len(devices)])
+
+    raise RuntimeError(
+        f"cloud slot index {slot_index} 没有对应 NPU 设备；"
+        f"CLOUD_SLOT_NPU_DEVICES={','.join(devices)!r}。"
+        "如果确实要多个 slot 共享 NPU，请显式设置 "
+        "CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION=true。"
+    )
 
 def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> DecodeSlotProcessInfo:
     http_port, grpc_port = allocate_cloud_slot_ports(slot_index, slot_id=slot_id)
@@ -83,6 +132,8 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
     env = os.environ.copy()
     backend_env_file = env.get("BACKEND_ENV_FILE", "").strip()
     app_env, env_file_name = current_runtime_env_metadata()
+    slot_model_device = _model_device_for_cloud_slot(slot_index)
+
     env.update({
         "APP_ENV": app_env,
         "ENV_FILE": env_file_name,
@@ -92,7 +143,12 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         "RUNTIME_PORT": str(http_port),
         "DECODE_GRPC_BIND": f"0.0.0.0:{grpc_port}",
         "DECODE_GRPC_TARGET": grpc_target,
+        "CLOUD_SLOT_ID": slot_id,
+        "CLOUD_SLOT_INDEX": str(slot_index),
     })
+
+    if slot_model_device:
+        env["MODEL_DEVICE"] = slot_model_device
     python_bin = settings.MODELSPLIT_PYTHON_BIN
     ascend_env_script = settings.ASCEND_ENV_SCRIPT
 
@@ -101,9 +157,15 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         source_ascend_env = f"source {shlex.quote(ascend_env_script)} && "
 
     command = (
+        f"set -euo pipefail && "
+        f"echo '[cloud-slot] slot_id={shlex.quote(slot_id)} "
+        f"slot_index={slot_index} "
+        f"MODEL_DEVICE=${{MODEL_DEVICE:-}} "
+        f"HTTP={http_port} "
+        f"GRPC={grpc_port}' >&2 && "
         f"{source_ascend_env}"
         f"cd {shlex.quote(settings.MODELSPLIT_DEV_ROOT)} && "
-        f"{shlex.quote(python_bin)} -m app.services.decode_server.app"
+        f"exec {shlex.quote(python_bin)} -m app.services.decode_server.app"
     )
     log_dir = Path('/tmp/modelsplit_phase2_logs')
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -117,6 +179,7 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
             env=env,
             stdout=stdout_handle,
             stderr=stderr_handle,
+            start_new_session=True,
         )
     finally:
         with suppress(Exception):
@@ -124,6 +187,20 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         with suppress(Exception):
             stderr_handle.close()
     _SLOT_PROCESSES[slot_id] = process
+    logger.info(
+        "启动 cloud decode slot: slot_id=%s slot_index=%s pid=%s http_port=%s grpc_port=%s "
+        "model_device=%s control_url=%s grpc_target=%s python=%s root=%s",
+        slot_id,
+        slot_index,
+        process.pid,
+        http_port,
+        grpc_port,
+        env.get("MODEL_DEVICE", ""),
+        control_url,
+        grpc_target,
+        python_bin,
+        settings.MODELSPLIT_DEV_ROOT,
+    )
     return DecodeSlotProcessInfo(
         slot_id=slot_id,
         slot_index=slot_index,

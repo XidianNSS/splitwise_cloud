@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -49,6 +49,63 @@ def ensure_phase2_schema() -> None:
 
 logger = logging.getLogger("AppLifespan")
 
+async def _cancel_background_task(task: asyncio.Task | None, task_name: str) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    logger.info("%s 已取消", task_name)
+
+
+def _stop_backend_managed_cloud_slots_on_shutdown() -> None:
+    from app.db.database import SessionLocal
+    from app.models.models import RuntimeSlot
+    from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
+
+    db = SessionLocal()
+    try:
+        slots = (
+            db.query(RuntimeSlot)
+            .filter(
+                RuntimeSlot.role == "cloud",
+                RuntimeSlot.spawned_by_scheduler == 1,
+            )
+            .all()
+        )
+
+        for slot in slots:
+            if slot.process_state not in {"running", "starting", "stopping", "failed", "needs_reconcile"}:
+                continue
+
+            logger.info(
+                "backend shutdown 正在停止托管 cloud slot: slot_id=%s pid=%s control_url=%s grpc_target=%s state=%s/%s",
+                slot.slot_id,
+                slot.process_pid,
+                slot.control_url,
+                slot.grpc_target,
+                slot.process_state,
+                slot.slot_state,
+            )
+
+            cleared_slot, stopped_ok = stop_and_clear_managed_cloud_slot(db, slot)
+
+            if stopped_ok:
+                logger.info(
+                    "backend shutdown 已清理 cloud slot: slot_id=%s process_state=%s slot_state=%s",
+                    cleared_slot.slot_id,
+                    cleared_slot.process_state,
+                    cleared_slot.slot_state,
+                )
+            else:
+                logger.warning(
+                    "backend shutdown 清理 cloud slot 失败: slot_id=%s pid=%s",
+                    slot.slot_id,
+                    slot.process_pid,
+                )
+    finally:
+        db.close()
+
 
 async def _slot_process_reaper_loop() -> None:
     from app.db.database import SessionLocal
@@ -95,8 +152,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         schedule_bootstrap_task = getattr(app.state, "schedule_bootstrap_task", None)
-        if schedule_bootstrap_task is not None:
-            schedule_bootstrap_task.cancel()
         slot_process_reaper_task = getattr(app.state, "slot_process_reaper_task", None)
-        if slot_process_reaper_task is not None:
-            slot_process_reaper_task.cancel()
+
+        await _cancel_background_task(schedule_bootstrap_task, "schedule_bootstrap_task")
+        await _cancel_background_task(slot_process_reaper_task, "slot_process_reaper_task")
+
+        _stop_backend_managed_cloud_slots_on_shutdown()

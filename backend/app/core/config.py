@@ -58,6 +58,23 @@ class Settings:
     CLOUD_SLOT_HTTP_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_HTTP_BASE_PORT", "19113"))
     CLOUD_SLOT_GRPC_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_GRPC_BASE_PORT", "52163"))
     CLOUD_SLOT_MAX_COUNT: int = int(os.getenv("CLOUD_SLOT_MAX_COUNT", "4"))
+
+    # 多 cloud slot 的 NPU 绑定表。
+    # 例如 CLOUD_SLOT_NPU_DEVICES=0,1 表示：
+    #   cloud-slot-0 -> npu:0
+    #   cloud-slot-1 -> npu:1
+    CLOUD_SLOT_NPU_DEVICES: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv("CLOUD_SLOT_NPU_DEVICES", "").split(",")
+        if item.strip()
+    )
+
+    # 默认不允许多个 cloud slot 共享同一张 NPU，避免无意中显存互抢。
+    CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION: bool = env_bool(
+        "CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION",
+        False,
+    )
+
     CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS: int = int(os.getenv("CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS", "30"))
     RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS: float = float(os.getenv("RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS", "5"))
     RUNTIME_CONFIRMATION_PATH: str = os.getenv("RUNTIME_CONFIRMATION_PATH", "/api/v1/runtime/confirmation/cloud")

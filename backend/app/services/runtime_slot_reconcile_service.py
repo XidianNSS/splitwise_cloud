@@ -85,8 +85,15 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
     session = _get_session(db, slot.owner_session_id)
     binding = _get_binding(db, slot.owner_binding_id)
     task = _get_task(db, slot.task_id)
-    binding_released = binding is None or binding.status in _FINISHED_BINDING_STATUSES
-    session_finished = session is None or session.status in _FINISHED_SESSION_STATUSES
+    has_owner_binding = bool(slot.owner_binding_id)
+    has_owner_session = bool(slot.owner_session_id)
+
+    binding_released = has_owner_binding and (
+        binding is None or binding.status in _FINISHED_BINDING_STATUSES
+    )
+    session_finished = has_owner_session and (
+        session is None or session.status in _FINISHED_SESSION_STATUSES
+    )
     task_active = _task_is_active(task)
     slot_active_loading = _slot_is_active_loading(slot, task)
     task_finished = task is not None and task.status in _FINISHED_TASK_STATUSES
@@ -172,6 +179,35 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
     draining = bool(state.get('draining'))
     runtime_model_type = state.get('model_type')
     runtime_task_id = state.get('task_id')
+
+    # backend 托管的 warm cloud slot：
+    # 进程已启动，但还没有绑定 session / binding / task，也还没加载模型。
+    # 这种 slot 应该保持 running/free/empty，等待后续 /load_strategy，
+    # 不能因为 owner 为空就被 reconcile 清理掉。
+    if (
+        bool(getattr(slot, "spawned_by_scheduler", 0))
+        and slot.slot_state == "free"
+        and not slot.owner_binding_id
+        and not slot.owner_session_id
+        and not slot.task_id
+        and active_request_count == 0
+        and not ready
+        and not draining
+        and not runtime_model_type
+        and not runtime_task_id
+    ):
+        return update_runtime_slot_state(
+            db,
+            slot,
+            process_state="running",
+            slot_state="free",
+            model_state="empty",
+            active_request_count=0,
+            model_type=None,
+            task_id=None,
+            last_used_at=datetime.utcnow(),
+        )
+
     if binding_released or session_finished:
         if ready and active_request_count == 0 and (runtime_model_type or runtime_task_id):
             try:
