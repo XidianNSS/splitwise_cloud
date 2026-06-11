@@ -157,7 +157,7 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         source_ascend_env = f"source {shlex.quote(ascend_env_script)} && "
 
     command = (
-        f"set -euo pipefail && "
+        f"set -eo pipefail && "
         f"echo '[cloud-slot] slot_id={shlex.quote(slot_id)} "
         f"slot_index={slot_index} "
         f"MODEL_DEVICE=${{MODEL_DEVICE:-}} "
