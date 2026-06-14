@@ -30,6 +30,16 @@ class DecodeSlotProcessInfo:
 _SLOT_PROCESSES: dict[str, subprocess.Popen] = {}
 _SLOT_PROCESS_LOCK = asyncio.Lock()
 logger = logging.getLogger("DecodeServerProcessManager")
+_PROXY_ENV_NAMES = {
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+}
 
 
 def _port_in_use(port: int) -> bool:
@@ -130,6 +140,8 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
     grpc_target = f"{advertised_host}:{grpc_port}"
 
     env = os.environ.copy()
+    for proxy_env_name in _PROXY_ENV_NAMES:
+        env.pop(proxy_env_name, None)
     backend_env_file = env.get("BACKEND_ENV_FILE", "").strip()
     app_env, env_file_name = current_runtime_env_metadata()
     slot_model_device = _model_device_for_cloud_slot(slot_index)
@@ -284,7 +296,7 @@ async def wait_for_slot_health(control_url: str, *, timeout_seconds: float = 30.
     health_url = control_url.rsplit("/load_strategy", 1)[0] + "/health"
     while asyncio.get_event_loop().time() < deadline:
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.get(health_url, timeout=2.0)
                 response.raise_for_status()
             return True

@@ -124,7 +124,7 @@ async def request_algorithm_decision(task_id: str, model_type: str, raw_input_js
         json.dumps(raw_input_json, ensure_ascii=False),
     )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.post(
             settings.ALGORITHM_API_URL,
             json=raw_input_json,

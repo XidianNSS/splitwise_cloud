@@ -120,7 +120,7 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
     chip_templates = PER_CHIP_QUERY_TEMPLATES.get(accelerator_type, {})
     chip_queries = {name: tpl.format(ip_regex=ip_regex) for name, tpl in chip_templates.items()}
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         agg_results = await asyncio.gather(*(query_prom(client, q) for q in agg_queries.values()))
         chip_series_results = await asyncio.gather(
             *(query_prom_series(client, q) for q in chip_queries.values())
@@ -153,7 +153,6 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
         "memory_percent": round(mem, 2),
         "gpu_util_percent": round(gpu_util, 2),
         "gpu_mem_used_mb": round(gpu_used, 2),
-        "gpu_mem_total_mb": round(gpu_used + gpu_free, 2) if (gpu_used + gpu_free) > 0 else 1.0,
         "gpu_mem_total_mb": round(gpu_total, 2) if gpu_total > 0 else 1.0,
         "accelerator_type": accelerator_type,
         "chips": sorted(chips.values(), key=lambda c: c["chip_id"]),

@@ -20,7 +20,7 @@ async def fetch_runtime_state(slot: RuntimeSlot, *, timeout: float = 5.0) -> dic
     if not slot.control_url:
         raise RuntimeError(f"runtime slot {slot.slot_id} 缺少 control_url")
     base_url = slot.control_url.removesuffix("/load_strategy")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.get(f"{base_url}/runtime_state", timeout=timeout)
         response.raise_for_status()
         return response.json()
@@ -43,7 +43,7 @@ async def unload_runtime_slot(
         model_state="draining",
         last_used_at=datetime.utcnow(),
     )
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.post(
             f"{base_url}/unload_model",
             json={"reason": reason},
@@ -103,7 +103,7 @@ async def forward_cloud_confirmation_to_edge(
         timeout,
     )
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 target_url,
                 json=request_payload,
