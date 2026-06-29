@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.core.lifespan import lifespan
 from app.web import dashboard
 
-from app.api.v1 import auth, users, devices, schedule, session
+from app.api.v1 import admin_runtime, auth, devices, schedule, session, users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
@@ -29,6 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(users.router, prefix="/api/v1/users", tags=["账号管理"])
     app.include_router(devices.router, prefix="/api/v1/system/devices", tags=["设备管理"])
     app.include_router(schedule.router, prefix="/api/v1/schedule", tags=["协同调度"])
+    app.include_router(admin_runtime.router, prefix="/api/v1/admin/runtime", tags=["运行态总览"])
     app.include_router(dashboard.router)
     app.mount("/static", StaticFiles(directory=settings.FRONTEND_DIR), name="static")
 

@@ -36,6 +36,16 @@ async def unload_runtime_slot(
     if not slot.control_url:
         raise RuntimeError(f"runtime slot {slot.slot_id} 缺少 control_url")
     base_url = slot.control_url.removesuffix("/load_strategy")
+    logger.warning(
+        "准备卸载 runtime slot: slot_id=%s role=%s owner_session=%s binding=%s task=%s target=%s reason=%s",
+        slot.slot_id,
+        slot.role,
+        slot.owner_session_id,
+        slot.owner_binding_id,
+        slot.task_id,
+        f"{base_url}/unload_model",
+        reason,
+    )
     update_runtime_slot_state(
         db,
         slot,

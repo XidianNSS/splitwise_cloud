@@ -95,6 +95,20 @@ def _list_session_owned_cloud_slots(db: Session, session_id: str) -> list[Runtim
     )
 
 
+def _get_reclaimable_retained_cloud_slot(db: Session) -> RuntimeSlot | None:
+    return (
+        db.query(RuntimeSlot)
+        .filter(
+            RuntimeSlot.role == "cloud",
+            RuntimeSlot.process_state == "running",
+            RuntimeSlot.slot_state == "retained",
+            RuntimeSlot.model_state == "ready",
+        )
+        .order_by(RuntimeSlot.idle_deadline.asc(), RuntimeSlot.updated_at.asc(), RuntimeSlot.slot_index.asc())
+        .first()
+    )
+
+
 def _get_session_owned_edge_slot(db: Session, session_id: str) -> RuntimeSlot | None:
     return (
         db.query(RuntimeSlot)
@@ -178,6 +192,77 @@ def _runtime_state_has_loaded_model(state: dict) -> bool:
 
 def _runtime_state_is_busy(state: dict) -> bool:
     return bool(state.get("draining")) or int(state.get("active_request_count") or 0) > 0
+
+
+async def _reclaim_retained_runtime_slot(
+    db: Session,
+    slot: RuntimeSlot,
+    *,
+    reason: str,
+) -> RuntimeSlot:
+    try:
+        state = await fetch_runtime_state(slot)
+    except Exception as exc:
+        _mark_slot_needs_reconcile_with_owner(
+            db,
+            slot,
+            owner_session_id=slot.owner_session_id,
+            owner_binding_id=slot.owner_binding_id,
+            task_id=slot.task_id,
+            model_type=slot.model_type,
+        )
+        raise RuntimeError(f"{slot.slot_id} runtime_state 获取失败，不能安全复用 retained slot: {exc}") from exc
+
+    if _runtime_state_is_busy(state):
+        raise RuntimeError(f"{slot.slot_id} 仍有活跃推理或正在卸载，不能复用 retained slot")
+
+    if _runtime_state_has_loaded_model(state):
+        try:
+            await unload_runtime_slot(db, slot, reason=reason)
+        except Exception as exc:
+            _mark_slot_needs_reconcile_with_owner(
+                db,
+                slot,
+                owner_session_id=slot.owner_session_id,
+                owner_binding_id=slot.owner_binding_id,
+                task_id=slot.task_id,
+                model_type=slot.model_type,
+            )
+            raise RuntimeError(f"{slot.slot_id} retained 模型卸载失败，不能复用该 slot") from exc
+
+    refreshed = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
+    if refreshed is None:
+        raise RuntimeError(f"{slot.slot_id} retained slot 回收后记录丢失")
+    return update_runtime_slot_state(
+        db,
+        refreshed,
+        process_state="running",
+        slot_state="free",
+        model_state="empty",
+        owner_session_id=None,
+        owner_binding_id=None,
+        task_id=None,
+        model_type=None,
+        active_request_count=0,
+        idle_deadline=None,
+        process_idle_deadline=None,
+        confirmation_status="none",
+        last_used_at=datetime.utcnow(),
+    )
+
+
+async def _prepare_edge_slot_for_task(db: Session, edge_slot: RuntimeSlot, task: ScheduleTask) -> RuntimeSlot:
+    if edge_slot.slot_state != "retained" and not (
+        edge_slot.model_state == "ready"
+        and edge_slot.owner_binding_id is None
+        and edge_slot.owner_session_id is None
+    ):
+        return edge_slot
+    return await _reclaim_retained_runtime_slot(
+        db,
+        edge_slot,
+        reason=f"task {task.task_id} reclaim retained edge slot {edge_slot.slot_id}",
+    )
 
 
 def _models_equal(left: str | None, right: str | None) -> bool:
@@ -399,6 +484,14 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
             process_idle_deadline=None,
         )
         return slot, True
+
+    retained_slot = _get_reclaimable_retained_cloud_slot(db)
+    if retained_slot is not None:
+        return await _reclaim_retained_runtime_slot(
+            db,
+            retained_slot,
+            reason=f"task {task.task_id} reclaim retained cloud slot {retained_slot.slot_id}",
+        ), False
 
     slot_index = _next_cloud_slot_index(db)
     if slot_index >= settings.CLOUD_SLOT_MAX_COUNT:
@@ -709,6 +802,11 @@ async def dispatch_loading_task(task_id: str) -> None:
             role="edge",
             control_url=build_runtime_control_url("edge", edge_ip),
         )
+        try:
+            edge_slot = await _prepare_edge_slot_for_task(db, edge_slot, task)
+        except Exception as exc:
+            await fail_task_and_promote(db, task, "边端 runtime slot 准备失败", str(exc))
+            return
         binding = None
         if task.runtime_binding_id:
             binding = db.query(RuntimeBinding).filter(RuntimeBinding.binding_id == task.runtime_binding_id).first()

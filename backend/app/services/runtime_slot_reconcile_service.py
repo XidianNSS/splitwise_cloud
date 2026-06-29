@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
 from app.services.decode_server_process_manager import inspect_slot_process
 from app.services.managed_cloud_slot_cleanup_service import clear_slot_ownership, stop_and_clear_managed_cloud_slot
@@ -17,6 +18,48 @@ _ACTIVE_TASK_PHASES = {"strategy", "loading", "completed"}
 _FINISHED_SESSION_STATUSES = {"closed", "expired"}
 _FINISHED_BINDING_STATUSES = {"released"}
 _FINISHED_TASK_STATUSES = {"failed", "completed"}
+
+
+def _release_grace_deadline() -> datetime | None:
+    if settings.RUNTIME_RELEASE_GRACE_SECONDS <= 0:
+        return None
+    return datetime.utcnow() + timedelta(seconds=settings.RUNTIME_RELEASE_GRACE_SECONDS)
+
+
+def _release_grace_active(slot: RuntimeSlot) -> bool:
+    return slot.idle_deadline is not None and slot.idle_deadline > datetime.utcnow()
+
+
+def _protect_ready_released_slot(
+    db: Session,
+    slot: RuntimeSlot,
+    *,
+    active_request_count: int,
+    runtime_model_type: str | None,
+    runtime_task_id: str | None,
+) -> RuntimeSlot | None:
+    if settings.RUNTIME_RELEASE_GRACE_SECONDS <= 0:
+        return None
+    if slot.idle_deadline is not None and not _release_grace_active(slot):
+        return None
+    deadline = slot.idle_deadline or _release_grace_deadline()
+    if deadline is None:
+        return None
+    return update_runtime_slot_state(
+        db,
+        slot,
+        process_state="running",
+        slot_state="retained",
+        model_state="ready",
+        active_request_count=active_request_count,
+        model_type=runtime_model_type or slot.model_type,
+        task_id=runtime_task_id or slot.task_id,
+        integrity_status="healthy",
+        confirmation_status="passed",
+        idle_deadline=deadline,
+        process_idle_deadline=None,
+        last_used_at=datetime.utcnow(),
+    )
 
 
 def _get_session(db: Session, session_id: str | None) -> EdgeSession | None:
@@ -208,8 +251,50 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
             last_used_at=datetime.utcnow(),
         )
 
+    if (
+        bool(getattr(slot, "spawned_by_scheduler", 0))
+        and not slot.owner_binding_id
+        and not slot.owner_session_id
+        and ready
+        and active_request_count == 0
+        and not draining
+        and (runtime_model_type or runtime_task_id)
+    ):
+        protected_slot = _protect_ready_released_slot(
+            db,
+            slot,
+            active_request_count=active_request_count,
+            runtime_model_type=runtime_model_type,
+            runtime_task_id=runtime_task_id,
+        )
+        if protected_slot is not None:
+            return protected_slot
+        try:
+            await unload_runtime_slot(db, slot, reason=f'reconcile orphan retained slot {slot.slot_id}')
+            return db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
+        except Exception:
+            return update_runtime_slot_state(
+                db,
+                slot,
+                process_state='failed',
+                slot_state='needs_reconcile',
+                model_state='failed',
+                last_used_at=datetime.utcnow(),
+            )
+
     if binding_released or session_finished:
         if ready and active_request_count == 0 and (runtime_model_type or runtime_task_id):
+            if binding is not None:
+                _release_binding(db, binding)
+            protected_slot = _protect_ready_released_slot(
+                db,
+                slot,
+                active_request_count=active_request_count,
+                runtime_model_type=runtime_model_type,
+                runtime_task_id=runtime_task_id,
+            )
+            if protected_slot is not None:
+                return protected_slot
             try:
                 await unload_runtime_slot(db, slot, reason=f'reconcile release for slot {slot.slot_id}')
                 return db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
@@ -281,6 +366,17 @@ async def _reconcile_base_or_edge_slot(db: Session, slot: RuntimeSlot) -> Runtim
 
     if binding_released or session_finished:
         if ready and active_request_count == 0 and (runtime_model_type or runtime_task_id):
+            if binding is not None:
+                _release_binding(db, binding)
+            protected_slot = _protect_ready_released_slot(
+                db,
+                slot,
+                active_request_count=active_request_count,
+                runtime_model_type=runtime_model_type,
+                runtime_task_id=runtime_task_id,
+            )
+            if protected_slot is not None:
+                return protected_slot
             try:
                 await unload_runtime_slot(db, slot, reason=f'reconcile release for slot {slot.slot_id}')
                 refreshed = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()

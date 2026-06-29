@@ -86,6 +86,9 @@ def get_running_free_cloud_slot(db: Session) -> RuntimeSlot | None:
             RuntimeSlot.role == "cloud",
             RuntimeSlot.process_state == "running",
             RuntimeSlot.slot_state == "free",
+            RuntimeSlot.model_state == "empty",
+            RuntimeSlot.owner_binding_id.is_(None),
+            RuntimeSlot.owner_session_id.is_(None),
         )
         .order_by(RuntimeSlot.slot_index.asc(), RuntimeSlot.slot_id.asc())
         .first()
@@ -165,9 +168,6 @@ def collect_allocated_cloud_ports(
 
     slots = query.all()
     for slot in slots:
-        if slot.process_state not in {"running", "starting"}:
-            continue
-
         http_port = _extract_port_from_control_url(slot.control_url)
         grpc_port = _extract_port_from_grpc_target(slot.grpc_target)
         if http_port is not None:

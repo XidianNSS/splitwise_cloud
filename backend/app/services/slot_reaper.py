@@ -1,11 +1,18 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot
 from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_slot_service import update_runtime_slot_state
+
+
+def release_grace_deadline() -> datetime | None:
+    if settings.RUNTIME_RELEASE_GRACE_SECONDS <= 0:
+        return None
+    return datetime.utcnow() + timedelta(seconds=settings.RUNTIME_RELEASE_GRACE_SECONDS)
 
 
 def mark_expired_sessions(db: Session) -> int:
@@ -81,7 +88,20 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
         if active_request_count != 0 or draining:
             continue
 
-        if ready or state.get("task_id") or state.get("model_type"):
+        deadline = release_grace_deadline()
+        if ready and deadline is not None:
+            update_runtime_slot_state(
+                db,
+                slot,
+                slot_state="retained",
+                model_state="ready",
+                active_request_count=0,
+                idle_deadline=slot.idle_deadline or deadline,
+                process_idle_deadline=None,
+                last_used_at=datetime.utcnow(),
+            )
+            released.append(slot.slot_id)
+        elif ready or state.get("task_id") or state.get("model_type"):
             try:
                 await unload_runtime_slot(
                     db,

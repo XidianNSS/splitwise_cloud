@@ -223,11 +223,281 @@ function switchGrafanaDevice() {
 }
 //新增判断是否是昇腾，若是昇腾，则展示grafana中昇腾专属dashborad，若不是，则展示用户监控大屏dashboard
 
+// ==========================================
+// 5. 云端运行态总览页面
+// ==========================================
+let runtimeRefreshTimer = null;
+let runtimeLastOverview = null;
+
+const PHASE_LABELS = {
+    strategy: "切分策略计算",
+    loading: "模型加载与完整性确认",
+    completed: "加载完成，等待推理",
+    failed: "失败"
+};
+
+const MODEL_STATE_LABELS = {
+    empty: "未加载模型",
+    loading: "模型加载中",
+    ready: "模型已就绪"
+};
+
+const SLOT_STATE_LABELS = {
+    free: "空闲",
+    bound: "已绑定",
+    retained: "模型保留中",
+    unloading: "卸载中",
+    needs_reconcile: "状态待校正"
+};
+
+const PROCESS_STATE_LABELS = {
+    running: "进程运行中",
+    stopped: "进程未启动",
+    failed: "进程异常"
+};
+
+function escapeHtml(value) {
+    if (value === null || value === undefined || value === "") return "-";
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+function shortId(value, size = 8) {
+    if (!value) return "-";
+    const text = String(value);
+    return text.length > size ? `${text.slice(0, size)}...` : text;
+}
+
+function formatTime(value) {
+    if (!value) return "-";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function clampPercent(value) {
+    const numeric = Number(value || 0);
+    return Math.max(0, Math.min(100, numeric));
+}
+
+function statusTone(value) {
+    if (["ready", "running", "completed", "free", "retained", "passed", true].includes(value)) return "ok";
+    if (["loading", "accepted", "bound", "pending", "strategy", "running_loading", "running_strategy"].includes(value)) return "warn";
+    if (["failed", "stopped", "needs_reconcile", false].includes(value)) return "bad";
+    return "neutral";
+}
+
+function badge(label, value) {
+    return `<span class="runtime-badge runtime-badge-${statusTone(value)}">${escapeHtml(label)}</span>`;
+}
+
+function renderRuntimeSummary(summary = {}) {
+    const cards = [
+        ["Cloud Slots", summary.cloud_slot_total, "登记的云端 decode slot"],
+        ["Running", summary.cloud_slot_running, "正在运行的 decode_server"],
+        ["Ready", summary.cloud_slot_ready, "模型已加载完成"],
+        ["Bound", summary.cloud_slot_bound, "已绑定到边端 session"],
+        ["Active Req", summary.active_request_total, "当前活跃推理请求"],
+        ["Waiting", summary.waiting_task_total, "加载/等待队列任务"],
+    ];
+    document.getElementById("runtime-summary-grid").innerHTML = cards.map(([title, value, desc]) => `
+        <div class="runtime-summary-card">
+            <span>${escapeHtml(title)}</span>
+            <strong>${escapeHtml(value ?? 0)}</strong>
+            <small>${escapeHtml(desc)}</small>
+        </div>
+    `).join("");
+}
+
+function renderRuntimeAlerts(alerts = []) {
+    const container = document.getElementById("runtime-alerts");
+    const activeAlerts = alerts.filter(alert => alert.source !== "task");
+    if (!activeAlerts.length) {
+        container.innerHTML = `<div class="runtime-alert runtime-alert-ok">当前没有检测到运行态异常。</div>`;
+        return;
+    }
+    container.innerHTML = activeAlerts.slice(0, 8).map(alert => `
+        <div class="runtime-alert runtime-alert-${escapeHtml(alert.level || "warning")}">
+            <strong>${escapeHtml(alert.level || "warning")}</strong>
+            <span>${escapeHtml(alert.message)}</span>
+            <code>${escapeHtml(alert.slot_id || alert.task_id || alert.source || "")}</code>
+        </div>
+    `).join("");
+}
+
+function renderCloudSlots(slots = []) {
+    document.getElementById("runtime-slot-count").textContent = `${slots.length} slots`;
+    const container = document.getElementById("runtime-cloud-slots");
+    if (!slots.length) {
+        container.innerHTML = `<div class="runtime-empty-card">暂无 cloud decode slot。</div>`;
+        return;
+    }
+    container.innerHTML = slots.map(slot => {
+        const runtimeState = slot.runtime_state || {};
+        const ownerSession = slot.owner_session || {};
+        const runtimeBadgeHtml = slot.process_state === "stopped"
+            ? badge("服务未启动", "stopped")
+            : runtimeState.ready === false && slot.model_state !== "ready" && slot.model_state !== "loading"
+                ? badge("模型未加载", false)
+                : "";
+        return `
+            <article class="runtime-slot-card runtime-slot-${statusTone(slot.slot_state)}">
+                <div class="runtime-slot-topline">
+                    <div>
+                        <span class="runtime-section-label">slot #${escapeHtml(slot.slot_index)}</span>
+                        <h4>${escapeHtml(slot.slot_id)}</h4>
+                    </div>
+                    ${badge(PROCESS_STATE_LABELS[slot.process_state] || slot.process_state, slot.process_state)}
+                </div>
+                <div class="runtime-badge-row">
+                    ${slot.slot_state === "retained" && slot.model_state === "ready" ? "" : badge(MODEL_STATE_LABELS[slot.model_state] || slot.model_state, slot.model_state)}
+                    ${badge(SLOT_STATE_LABELS[slot.slot_state] || slot.slot_state, slot.slot_state)}
+                    ${runtimeBadgeHtml}
+                </div>
+                <dl class="runtime-kv">
+                    <div><dt>模型</dt><dd>${escapeHtml(slot.model_type || runtimeState.model_type)}</dd></div>
+                    <div><dt>使用边端</dt><dd>${escapeHtml(ownerSession.edge_device_name || ownerSession.edge_ip || slot.owner_session_id)}</dd></div>
+                    <div><dt>Task</dt><dd title="${escapeHtml(slot.task_id || runtimeState.task_id)}">${escapeHtml(shortId(slot.task_id || runtimeState.task_id, 12))}</dd></div>
+                    <div><dt>PID</dt><dd>${escapeHtml(slot.process_pid)}</dd></div>
+                    <div><dt>HTTP</dt><dd>${escapeHtml(slot.control_url)}</dd></div>
+                    <div><dt>gRPC</dt><dd>${escapeHtml(slot.grpc_target)}</dd></div>
+                    <div><dt>活跃请求</dt><dd>${escapeHtml(runtimeState.active_request_count ?? slot.active_request_count)}</dd></div>
+                    <div><dt>完整性</dt><dd>${escapeHtml(slot.integrity_status)} / ${escapeHtml(slot.confirmation_status)}</dd></div>
+                </dl>
+                ${slot.runtime_state_error ? `<div class="runtime-inline-error">${escapeHtml(slot.runtime_state_error)}</div>` : ""}
+            </article>
+        `;
+    }).join("");
+}
+
+function progressBar(label, value) {
+    const percent = clampPercent(value);
+    return `
+        <div class="runtime-progress">
+            <div class="runtime-progress-meta"><span>${escapeHtml(label)}</span><strong>${percent}%</strong></div>
+            <div class="runtime-progress-track"><div style="width:${percent}%"></div></div>
+        </div>
+    `;
+}
+
+function renderTaskTimeline(tasks = []) {
+    const container = document.getElementById("runtime-task-timeline");
+    const activeTasks = tasks.filter(task => ["accepted", "running"].includes(task.status));
+    const recentFailedTasks = tasks.filter(task => task.status === "failed").slice(0, 3);
+    if (!activeTasks.length) {
+        const failedHtml = recentFailedTasks.length ? `
+            <div class="runtime-history-block">
+                <div class="runtime-history-title">最近失败记录</div>
+                ${recentFailedTasks.map(task => `
+                    <div class="runtime-history-item">
+                        <span title="${escapeHtml(task.task_id)}">${escapeHtml(shortId(task.task_id, 12))}</span>
+                        <small>${escapeHtml(task.message || task.error_detail)}</small>
+                    </div>
+                `).join("")}
+            </div>
+        ` : "";
+        container.innerHTML = `<div class="runtime-empty-card">暂无运行中的调度任务。</div>${failedHtml}`;
+        return;
+    }
+    container.innerHTML = activeTasks.slice(0, 8).map(task => `
+        <article class="runtime-task-card">
+            <div class="runtime-task-head">
+                <div>
+                    <span class="runtime-section-label">${escapeHtml(PHASE_LABELS[task.phase] || task.phase)}</span>
+                    <h4 title="${escapeHtml(task.task_id)}">${escapeHtml(shortId(task.task_id, 14))}</h4>
+                </div>
+                ${badge(task.status, task.status)}
+            </div>
+            <p>${escapeHtml(task.message || task.error_detail)}</p>
+            ${progressBar("总体进度", task.overall_progress)}
+            <div class="runtime-progress-pair">
+                ${progressBar("Edge 策略", task.edge_strategy_progress)}
+                ${progressBar("Cloud 策略", task.cloud_strategy_progress)}
+                ${progressBar("Edge 完整性", task.edge_integrity_progress)}
+                ${progressBar("Cloud 完整性", task.cloud_integrity_progress)}
+                ${progressBar("Edge 加载", task.edge_runtime_load_progress)}
+                ${progressBar("Cloud 加载", task.cloud_runtime_load_progress)}
+            </div>
+            <div class="runtime-task-foot">
+                <span>${escapeHtml(task.session?.edge_device_name || task.edge_device?.name || task.edge_slot_id)}</span>
+                <span>${escapeHtml(formatTime(task.updated_at))}</span>
+            </div>
+            ${task.error_detail ? `<div class="runtime-inline-error">${escapeHtml(task.error_detail)}</div>` : ""}
+        </article>
+    `).join("");
+}
+
+function renderRuntimeBindings(bindings = []) {
+    const tbody = document.getElementById("runtime-binding-table");
+    if (!bindings.length) {
+        tbody.innerHTML = `<tr><td colspan="6">暂无运行时绑定。</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = bindings.slice(0, 12).map(binding => `
+        <tr>
+            <td title="${escapeHtml(binding.session_id)}">${escapeHtml(shortId(binding.session_id, 12))}</td>
+            <td>${escapeHtml(binding.session?.edge_device_name || binding.session?.edge_ip)}</td>
+            <td>${escapeHtml(binding.edge_slot_id)}</td>
+            <td>${escapeHtml(binding.cloud_slot_id)}</td>
+            <td title="${escapeHtml(binding.task_id)}">${escapeHtml(shortId(binding.task_id, 12))}</td>
+            <td>${badge(binding.status, binding.status)}</td>
+        </tr>
+    `).join("");
+}
+
+function renderRuntimeOverview(data) {
+    runtimeLastOverview = data;
+    renderRuntimeSummary(data.summary);
+    renderRuntimeAlerts(data.alerts);
+    renderCloudSlots(data.cloud_slots);
+    renderTaskTimeline(data.recent_tasks);
+    renderRuntimeBindings(data.bindings);
+    const generatedAt = data.generated_at ? formatTime(data.generated_at) : "未知时间";
+    document.getElementById("runtime-refresh-status").textContent = `最后刷新: ${generatedAt}`;
+}
+
+async function refreshRuntimeOverview() {
+    const status = document.getElementById("runtime-refresh-status");
+    if (!status) return;
+    status.textContent = "正在刷新...";
+    try {
+        const response = await fetchWithAuth(`${API_BASE_URL}/admin/runtime/overview`);
+        const data = await response.json();
+        renderRuntimeOverview(data);
+    } catch (error) {
+        status.textContent = `刷新失败: ${error.message}`;
+        if (!runtimeLastOverview) {
+            document.getElementById("runtime-summary-grid").innerHTML = `<div class="runtime-empty-card">运行态接口暂不可用：${escapeHtml(error.message)}</div>`;
+        }
+    }
+}
+
+function startRuntimeAutoRefresh() {
+    if (runtimeRefreshTimer) return;
+    refreshRuntimeOverview();
+    runtimeRefreshTimer = window.setInterval(refreshRuntimeOverview, 5000);
+}
+
+function stopRuntimeAutoRefresh() {
+    if (!runtimeRefreshTimer) return;
+    window.clearInterval(runtimeRefreshTimer);
+    runtimeRefreshTimer = null;
+}
+
 function switchView(viewId, navElement) {
     document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
     document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
     document.getElementById(viewId).classList.add('active');
     navElement.classList.add('active');
+    if (viewId === "view-sandbox") {
+        startRuntimeAutoRefresh();
+    } else {
+        stopRuntimeAutoRefresh();
+    }
 }
 
 function initializeDashboard() {

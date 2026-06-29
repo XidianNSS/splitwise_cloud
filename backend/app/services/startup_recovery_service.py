@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
 from app.services.managed_cloud_slot_cleanup_service import clear_slot_ownership, stop_and_clear_managed_cloud_slot
 from app.services.runtime_binding_service import update_runtime_binding
@@ -11,6 +12,37 @@ from app.services.runtime_slot_service import update_runtime_slot_state
 
 _ACTIVE_TASK_STATUSES = {"accepted", "running"}
 _FINISHED_SESSION_STATUSES = {"closed", "expired"}
+
+
+def _release_grace_deadline() -> datetime | None:
+    if settings.RUNTIME_RELEASE_GRACE_SECONDS <= 0:
+        return None
+    return datetime.utcnow() + timedelta(seconds=settings.RUNTIME_RELEASE_GRACE_SECONDS)
+
+
+def _ready_slot_can_enter_release_grace(slot: RuntimeSlot) -> bool:
+    if settings.RUNTIME_RELEASE_GRACE_SECONDS <= 0:
+        return False
+    if slot.model_state != 'ready':
+        return False
+    if int(slot.active_request_count or 0) != 0:
+        return False
+    if slot.idle_deadline is not None and slot.idle_deadline <= datetime.utcnow():
+        return False
+    return True
+
+
+def _protect_ready_slot_from_immediate_release(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
+    deadline = slot.idle_deadline or _release_grace_deadline()
+    return update_runtime_slot_state(
+        db,
+        slot,
+        slot_state='retained',
+        model_state='ready',
+        idle_deadline=deadline,
+        process_idle_deadline=None,
+        last_used_at=datetime.utcnow(),
+    )
 
 
 def _get_task(db: Session, task_id: str | None) -> ScheduleTask | None:
@@ -201,6 +233,11 @@ def recover_runtime_ownership_on_startup(db: Session) -> None:
         )
 
         if binding_released or session_finished or task_missing or task_untrusted_completed:
+            if _ready_slot_can_enter_release_grace(slot):
+                if binding is not None and binding.status != 'released':
+                    _release_binding(binding)
+                _protect_ready_slot_from_immediate_release(db, slot)
+                continue
             if binding is not None and binding.status != 'released':
                 _release_binding(binding)
             if task is not None and (task.status in _ACTIVE_TASK_STATUSES or task.phase == 'loading'):
@@ -229,6 +266,11 @@ def reconcile_runtime_ownership(db: Session) -> None:
             continue
 
         if binding_missing or session_missing or task_missing or binding_released or session_finished or task_failed:
+            if _ready_slot_can_enter_release_grace(slot):
+                if binding is not None and binding.status != 'released':
+                    _release_binding(binding)
+                _protect_ready_slot_from_immediate_release(db, slot)
+                continue
             if binding is not None:
                 _release_binding(binding)
             _clear_slot_owner(db, slot)
