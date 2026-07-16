@@ -155,6 +155,10 @@ class RuntimeSlot(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     idle_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     process_idle_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    startup_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    startup_failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

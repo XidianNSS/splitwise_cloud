@@ -5,6 +5,7 @@ import signal
 import shlex
 import socket
 import subprocess
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -170,11 +171,11 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
 
     command = (
         f"set -eo pipefail && "
-        f"echo '[cloud-slot] slot_id={shlex.quote(slot_id)} "
+        f"echo \"[cloud-slot] slot_id={slot_id} "
         f"slot_index={slot_index} "
         f"MODEL_DEVICE=${{MODEL_DEVICE:-}} "
         f"HTTP={http_port} "
-        f"GRPC={grpc_port}' >&2 && "
+        f"GRPC={grpc_port}\" >&2 && "
         f"{source_ascend_env}"
         f"cd {shlex.quote(settings.MODELSPLIT_DEV_ROOT)} && "
         f"exec {shlex.quote(python_bin)} -m app.services.decode_server.app"
@@ -237,6 +238,14 @@ def inspect_slot_process(slot_id: str) -> subprocess.Popen | None:
 def stop_slot_process(slot_id: str, *, process_pid: int | None = None) -> bool:
     process = inspect_slot_process(slot_id)
     if process is not None:
+        if process_pid is not None and process.pid != process_pid:
+            logger.warning(
+                "拒绝停止已被新进程接管的 cloud slot: slot_id=%s expected_pid=%s current_pid=%s",
+                slot_id,
+                process_pid,
+                process.pid,
+            )
+            return False
         process.terminate()
         try:
             process.wait(timeout=10)
@@ -258,7 +267,6 @@ def stop_slot_process(slot_id: str, *, process_pid: int | None = None) -> bool:
     except OSError:
         return False
 
-    import time
     deadline = time.time() + 10.0
     while time.time() < deadline:
         try:
@@ -291,10 +299,45 @@ def stop_slot_process(slot_id: str, *, process_pid: int | None = None) -> bool:
     return False
 
 
-async def wait_for_slot_health(control_url: str, *, timeout_seconds: float = 30.0) -> bool:
+def _stderr_tail(slot_id: str, *, max_chars: int = 1200) -> str:
+    path = Path("/tmp/modelsplit_phase2_logs") / f"{slot_id}.err.log"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars * 2), os.SEEK_SET)
+            return handle.read().decode("utf-8", errors="replace")[-max_chars:].strip()
+    except OSError:
+        return ""
+
+
+async def wait_for_slot_health(
+    control_url: str,
+    *,
+    timeout_seconds: float = 30.0,
+    slot_id: str | None = None,
+    process_pid: int | None = None,
+) -> bool:
+    started = asyncio.get_event_loop().time()
     deadline = asyncio.get_event_loop().time() + timeout_seconds
     health_url = control_url.rsplit("/load_strategy", 1)[0] + "/health"
     while asyncio.get_event_loop().time() < deadline:
+        if slot_id and process_pid is not None:
+            process = _SLOT_PROCESSES.get(slot_id)
+            if process is not None and process.pid == process_pid:
+                exit_code = process.poll()
+                if exit_code is not None:
+                    if _SLOT_PROCESSES.get(slot_id) is process:
+                        _SLOT_PROCESSES.pop(slot_id, None)
+                    logger.error(
+                        "cloud slot 启动进程提前退出: slot_id=%s pid=%s exit_code=%s elapsed=%.2fs stderr_tail=%r",
+                        slot_id,
+                        process_pid,
+                        exit_code,
+                        asyncio.get_event_loop().time() - started,
+                        _stderr_tail(slot_id),
+                    )
+                    return False
         try:
             async with httpx.AsyncClient(trust_env=False) as client:
                 response = await client.get(health_url, timeout=2.0)
@@ -302,6 +345,13 @@ async def wait_for_slot_health(control_url: str, *, timeout_seconds: float = 30.
             return True
         except Exception:
             await asyncio.sleep(0.5)
+    logger.error(
+        "cloud slot 健康检查超时: slot_id=%s pid=%s timeout=%.2fs stderr_tail=%r",
+        slot_id,
+        process_pid,
+        timeout_seconds,
+        _stderr_tail(slot_id) if slot_id else "",
+    )
     return False
 
 

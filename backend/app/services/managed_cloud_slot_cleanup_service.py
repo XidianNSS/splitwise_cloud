@@ -26,6 +26,7 @@ def clear_slot_owner_fields() -> dict:
         "confirmation_status": "none",
         "idle_deadline": None,
         "process_idle_deadline": None,
+        "startup_deadline": None,
         "last_used_at": datetime.utcnow(),
     }
 

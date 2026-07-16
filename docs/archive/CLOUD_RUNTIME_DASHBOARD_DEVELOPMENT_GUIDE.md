@@ -1,4 +1,7 @@
-# 云端运行态页面开发指导文档
+# 【已归档】云端运行态页面开发指导文档
+
+> 本文是运行态页面开发阶段的设计稿，页面和接口已经实现，不再作为当前开发依据。
+> 当前接口行为以 `backend/app/api/v1/admin_runtime.py` 和现有 dashboard 代码为准。
 
 ## 1. 当前前端页面确认
 
@@ -376,4 +379,3 @@ const PROCESS_STATE_LABELS = {
 - 页面能识别并突出异常 slot 或失败任务。
 - 页面使用管理员登录 token 即可访问，不依赖 OpenWebUI token。
 - 所有接口只读，不触发调度、不启动/停止 decode_server、不修改数据库状态。
-

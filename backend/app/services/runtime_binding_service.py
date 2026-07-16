@@ -14,6 +14,7 @@ def create_runtime_binding(
     edge_slot_id: str | None,
     cloud_slot_id: str | None,
     partition_digest: str | None = None,
+    status: str = "binding",
 ) -> RuntimeBinding:
     binding = RuntimeBinding(
         binding_id=str(uuid.uuid4()),
@@ -22,7 +23,7 @@ def create_runtime_binding(
         edge_slot_id=edge_slot_id,
         cloud_slot_id=cloud_slot_id,
         partition_digest=partition_digest,
-        status="binding",
+        status=status,
     )
     db.add(binding)
     db.commit()

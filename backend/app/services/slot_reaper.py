@@ -1,3 +1,5 @@
+import logging
+from contextlib import suppress
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
@@ -7,6 +9,9 @@ from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot
 from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_slot_service import update_runtime_slot_state
+
+
+logger = logging.getLogger("SlotReaper")
 
 
 def release_grace_deadline() -> datetime | None:
@@ -136,24 +141,51 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
 
 
 
-def stop_idle_spawned_cloud_slots(db: Session) -> list[str]:
+def stop_idle_spawned_cloud_slots(
+    db: Session,
+    *,
+    failed_slots: list[dict[str, str]] | None = None,
+) -> list[str]:
+    """停止超过进程空闲期限的托管 cloud slot。
+
+    每个 slot 独立处理；进程停止或数据库更新失败时回滚当前事务并继续
+    后续 slot，避免单个残留进程阻塞整个后台维护循环。
+    """
     now = datetime.utcnow()
-    slots = (
-        db.query(RuntimeSlot)
-        .filter(
-            RuntimeSlot.role == "cloud",
-            RuntimeSlot.spawned_by_scheduler == 1,
-            RuntimeSlot.slot_state == "free",
-            RuntimeSlot.process_state == "running",
-            RuntimeSlot.process_idle_deadline.isnot(None),
-            RuntimeSlot.process_idle_deadline <= now,
+    slot_ids = [
+        slot.slot_id
+        for slot in (
+            db.query(RuntimeSlot)
+            .filter(
+                RuntimeSlot.role == "cloud",
+                RuntimeSlot.spawned_by_scheduler == 1,
+                RuntimeSlot.slot_state == "free",
+                RuntimeSlot.process_state == "running",
+                RuntimeSlot.process_idle_deadline.isnot(None),
+                RuntimeSlot.process_idle_deadline <= now,
+            )
+            .all()
         )
-        .all()
-    )
+    ]
     stopped: list[str] = []
-    for slot in slots:
-        _, stopped_ok = stop_and_clear_managed_cloud_slot(db, slot)
-        if not stopped_ok:
-            continue
-        stopped.append(slot.slot_id)
+    for slot_id in slot_ids:
+        try:
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if slot is None:
+                continue
+            _, stopped_ok = stop_and_clear_managed_cloud_slot(db, slot)
+            if not stopped_ok:
+                error = "managed cloud slot process stop failed"
+                if failed_slots is not None:
+                    failed_slots.append({"slot_id": slot_id, "error": error})
+                logger.warning("空闲托管 cloud slot 停止失败: slot_id=%s", slot_id)
+                continue
+            stopped.append(slot_id)
+        except Exception as exc:
+            with suppress(Exception):
+                db.rollback()
+            error = f"{type(exc).__name__}: {exc}"[:512]
+            if failed_slots is not None:
+                failed_slots.append({"slot_id": slot_id, "error": error})
+            logger.exception("空闲托管 cloud slot 清理异常，已跳过: slot_id=%s", slot_id)
     return stopped

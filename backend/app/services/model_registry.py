@@ -36,8 +36,8 @@ MODEL_REGISTRY = {
         "hidden_size": 3072,
         "intermediate_size": 8192,
         "vocab_size": 128256,
-        "edge_min_free_gpu_mem_mb": None,
-        "cloud_min_free_gpu_mem_mb": None,
+        "edge_min_free_gpu_mem_mb": 12288,
+        "cloud_min_free_gpu_mem_mb": 12288,
     },
 }
 

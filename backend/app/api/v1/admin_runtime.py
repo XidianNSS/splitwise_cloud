@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_admin, get_db
@@ -19,6 +19,23 @@ router = APIRouter()
 
 RUNTIME_STATE_TIMEOUT_SECONDS = 5.0
 RECENT_TASK_LIMIT = 20
+
+
+def _runtime_maintenance_payload(request: Request) -> dict[str, Any]:
+    state = getattr(request.app.state, "runtime_maintenance_state", None)
+    if not isinstance(state, dict):
+        return {
+            "status": "stopped",
+            "task_running": False,
+            "last_started_at": None,
+            "last_completed_at": None,
+            "last_success_at": None,
+            "total_cycles": 0,
+            "consecutive_failure_count": 0,
+            "last_error": "runtime maintenance state is unavailable",
+            "last_cycle": None,
+        }
+    return dict(state)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -154,6 +171,7 @@ def _build_summary(slots: list[dict[str, Any]], loading_queue: list[dict[str, An
 
 @router.get("/overview", summary="【Admin】查询云端运行态总览")
 async def get_runtime_overview(
+    request: Request,
     admin_user: User = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -230,8 +248,27 @@ async def get_runtime_overview(
     for task in recent_task_payloads:
         alerts.extend(_task_alerts(task))
 
+    maintenance = _runtime_maintenance_payload(request)
+    if maintenance["status"] == "degraded":
+        alerts.append(
+            {
+                "level": "warning",
+                "source": "maintenance",
+                "message": f"runtime reconcile 后台维护异常: {maintenance.get('last_error') or 'unknown error'}",
+            }
+        )
+    elif maintenance["status"] == "stopped":
+        alerts.append(
+            {
+                "level": "critical",
+                "source": "maintenance",
+                "message": f"runtime reconcile 后台任务已停止: {maintenance.get('last_error') or 'unknown error'}",
+            }
+        )
+
     return {
         "generated_at": datetime.utcnow().isoformat(),
+        "maintenance": maintenance,
         "summary": _build_summary(slot_payloads, loading_queue, recent_task_payloads),
         "devices": [_serialize_device(device) for device in devices],
         "edge_sessions": edge_sessions,

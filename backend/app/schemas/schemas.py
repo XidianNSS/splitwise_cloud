@@ -142,6 +142,10 @@ class RuntimeSlotStatusResponse(BaseModel):
     last_used_at: Optional[str] = None
     idle_deadline: Optional[str] = None
     process_idle_deadline: Optional[str] = None
+    startup_deadline: Optional[str] = None
+    startup_failure_count: int = 0
+    retry_after: Optional[str] = None
+    last_error: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

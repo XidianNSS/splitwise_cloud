@@ -1,264 +1,219 @@
-# 模型推理服务对接说明
+# ModelSplit Runtime 对接说明
 
-目标：让边端模型推理服务 / 云端模型推理服务开发者尽快明确当前如何与云端后端对接。
+本文面向边端 prefill runtime 和云端 decode runtime 开发者。接口以当前
+`splitwise_cloud/backend` 与 `ModelSplit` 代码为准。
 
-## 当前对接规则
+## 1. 调用关系
 
-- 不再使用 `register / unregister`
-- 云端后端不会再动态发现模型推理服务节点
-- 当前统一采用“固定控制端口 + 进度回调 + 完整性确认回调”方案
+一次调度的控制链路如下：
 
-## 当前主流程
+1. backend 计算切分策略并分配 edge/cloud runtime slot。
+2. backend 同时向两端的 `POST /load_strategy` 下发任务。
+3. runtime 异步加载模型，通过带角色的 callback 上报进度。
+4. backend 通过 `/runtime_state` 对账，并在释放资源时调用 `/unload_model`。
+5. 启用 Aloepri 时，cloud runtime 经 backend 把完整性确认转发给 edge runtime。
 
-1. 边端前端向云端后端发起调度
-2. 云端后端完成资源检查并拿到切分策略
-3. 云端后端分别向边端模型推理服务、云端模型推理服务的固定控制端口发送启动请求
-4. 模型推理服务内部启动对应模型并加载切分策略
-5. 模型推理服务持续回调加载进度
-6. 若启用 Aloepri 完整性链路，云端 runtime 还会向 scheduler 回调完整性确认
-7. 云端后端聚合进度并更新任务状态
+不使用 runtime 注册或注销接口。开发测试可启用 mock 配置，但正式服务与开发测试使用同一套协议。
 
----
+## 2. 地址和端口
 
-## 1. 控制面入口
+runtime 必须提供以下 HTTP 接口：
 
-当前控制路径：
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `POST` | `/load_strategy` | 接收模型和切分策略 |
+| `GET` | `/health` | 进程健康检查 |
+| `GET` | `/runtime_state` | 返回真实生命周期状态 |
+| `POST` | `/unload_model` | 卸载当前模型并清除任务身份 |
 
-```text
+edge prefill 的正式控制端口是 `9001`，backend 根据 `/session/init` 识别出的边端 IP 访问它。
+
+云端 decode 由 backend 托管。按当前 `.env.prod`：
+
+- HTTP 端口从 `9020` 开始：`9020 + slot_index`
+- gRPC 端口从 `51200` 开始：`51200 + slot_index`
+- slot 上限为 `2`
+
+调用方不得自行拼接 cloud decode 地址，必须使用 backend 下发的 `runtime_route`。
+
+## 3. 加载策略
+
+```http
 POST /load_strategy
+Content-Type: application/json
 ```
 
-此外，runtime 还应提供：
-
-- `GET /health`
-- `GET /runtime_state`
-- `POST /unload_model`
-
-### 固定控制端口（基础正式口径）
-
-当前正式基础口径：
-
-- edge real: `9001`
-- cloud base decode real: `9002`
-
-### 动态 cloud slot 说明
-
-当前 backend 已支持自动托管多个 cloud decode slot。
-
-因此：
-- `cloud-slot-0` 可以是基础 cloud decode
-- `cloud-slot-1 / cloud-slot-2 / ...` 可能使用新的动态端口
-- **前端和 runtime 开发者不应假设所有云端 decode 都固定在 `9002`**
-
-真正应以 backend 下发的 `runtime_route.cloud_control_url` 和 `runtime_route.cloud_decode_grpc_target` 为准。
-
----
-
-## 2. 云端后端下发给模型推理服务的请求体
-
-当前请求体是 `LoadStrategyRequest` 语义，核心字段如下：
+当前请求结构：
 
 ```json
 {
   "task_id": "624a1db9-eaa0-4257-9a38-7d6469357048",
-  "model_type": "Llama-3.2-3b",
+  "model_type": "Llama-3.2-3B-Instruct",
   "decision": {
     "layer_partitions": [
       {
         "layer_id": 0,
-        "head_assignments": [0, 1, 0, 1],
-        "ffn_assignment": 0,
-        "edge_head_count": 2,
-        "cloud_head_count": 2
+        "head_assignments": [0, 0, 1, 1],
+        "ffn_assignment": 1
       }
     ]
   },
   "runtime_route": {
-    "cloud_slot_id": "cloud-slot-1",
-    "cloud_control_url": "http://10.144.144.2:9011/load_strategy",
-    "cloud_decode_grpc_target": "10.144.144.2:51101",
-    "scheduler_integrity_callback_url": "http://10.144.144.2:8010/api/v1/schedule/runtime/confirmation/cloud"
+    "cloud_slot_id": "cloud-slot-0",
+    "cloud_control_url": "http://10.144.144.4:9020/load_strategy",
+    "cloud_decode_grpc_target": "10.144.144.4:51200",
+    "scheduler_integrity_callback_url": "http://10.144.144.4:8010/api/v1/schedule/runtime/confirmation/cloud"
   }
 }
 ```
 
-字段含义：
+字段约定：
 
-- `task_id`
-  - 后续进度回调用它关联任务
+- `task_id`：本次加载的唯一任务 ID；后续回调必须原样携带。
+- `model_type`：传给 ModelSplit runtime 的规范模型名。
+- `decision.layer_partitions`：逐层切分结果；head/FFN 中 `0` 表示 edge，`1` 表示 cloud，FFN 还允许 `2` 表示拆分。
+- `runtime_route.cloud_slot_id`：本次分配的 cloud slot。
+- `runtime_route.cloud_decode_grpc_target`：edge prefill/coordinator 应连接的 decode gRPC 地址。
+- `runtime_route.scheduler_integrity_callback_url`：cloud runtime 的完整性确认回调地址。
 
-- `model_type`
-  - 本次要启动的模型
+当前 backend 总会下发 `runtime_route`。edge runtime 应优先使用其中的
+`cloud_decode_grpc_target`，不能只依赖进程级 `DECODE_GRPC_TARGET`。
 
-- `decision`
-  - 切分策略
-
-- `runtime_route`
-  - 当前 runtime 所需的云端路由信息
-  - 主要用于：
-    - edge prefill 找到正确的 cloud decode gRPC 目标
-    - cloud runtime 找到正确的 scheduler 完整性确认回调入口
-
-### `runtime_route` 字段说明
-
-- `cloud_slot_id`
-  - 当前任务分配到的 cloud slot 标识
-
-- `cloud_control_url`
-  - 当前 cloud runtime 的控制面地址
-
-- `cloud_decode_grpc_target`
-  - 当前任务真正应连接的 cloud decode gRPC 目标
-  - 当前 runtime 应优先使用它，而不是只依赖全局 `DECODE_GRPC_TARGET`
-
-- `scheduler_integrity_callback_url`
-  - 当前 Aloepri 完整性确认回调的 scheduler 地址
-  - cloud runtime 应优先使用它，而不是直连 edge runtime
-
----
-
-## 3. 模型推理服务控制端口应返回什么
-
-建议快速返回：
+成功接收后应尽快返回，不要等待模型加载完成：
 
 ```json
 {
   "status": "accepted",
-  "message": "model service startup accepted"
+  "message": "runtime loading started"
 }
 ```
 
-这里的 `accepted` 只表示“已接收启动请求”，不表示模型已经加载完成。
+backend 接受 `status=accepted` 或 `status=ok`。HTTP 非 2xx、无法解析 JSON，或其他
+`status` 都会被视为下发失败。backend 的单次下发超时为 5 秒。
 
-如果模型推理服务明确无法受理，也可以返回非 `accepted` 状态，云端后端会把任务标记为失败。
+runtime 正在加载其他任务时应返回 `409`；请求或模型非法可返回 `400`；运行环境不可用可返回 `503`。
 
----
+## 4. 加载进度回调
 
-## 4. 模型推理服务进度回调
+| runtime | 回调地址 |
+|---|---|
+| edge | `POST /api/v1/schedule/runtime_callback/edge` |
+| cloud | `POST /api/v1/schedule/runtime_callback/cloud` |
 
-边端模型推理服务回调地址：
-
-```http
-POST /api/v1/schedule/runtime_callback/edge
-```
-
-云端模型推理服务回调地址：
-
-```http
-POST /api/v1/schedule/runtime_callback/cloud
-```
-
-### 回调体格式
+地址基于 `BACKEND_BASE_URL`。请求体：
 
 ```json
 {
   "task_id": "624a1db9-eaa0-4257-9a38-7d6469357048",
   "status": "loading",
-  "progress": 50,
-  "message": "waiting cloud confirmation",
-  "stage": "integrity"
-}
-```
-
-当前回调字段：
-
-- `task_id`
-- `status`
-- `progress`
-- `message`
-- `stage`（可选）
-- `node_role`（可选；当前推荐使用带角色的回调地址，因此通常不必传）
-
-### `stage` 当前语义
-
-- `runtime_load`
-  - 表示模型/执行器加载阶段
-- `integrity`
-  - 表示 Aloepri 完整性检验阶段
-- 为空时
-  - backend 会按兼容逻辑视为 `runtime_load`
-
-### 失败时回调
-
-```json
-{
-  "task_id": "624a1db9-eaa0-4257-9a38-7d6469357048",
-  "status": "failed",
-  "progress": 0,
-  "message": "云端模型实例启动失败",
+  "progress": 60,
+  "message": "model weights loading",
   "stage": "runtime_load"
 }
 ```
 
-### 完成时回调
+- `status`：`loading`、`ready`、`completed` 或 `failed`。
+- `progress`：整数，backend 会限制在 `0..100`。
+- `stage`：`runtime_load` 或 `integrity`；省略时按 `runtime_load` 处理。
+- `node_role`：使用上述带角色路径时无需传递。
+
+加载成功必须以 `ready` 或 `completed`、`progress=100` 结束。加载失败使用
+`status=failed`，并在 `message` 中给出可定位的原因。当前进度回调接口不校验
+Bearer token，只应暴露在可信内网。
+
+如果 runtime 没有单独上报 `integrity` 阶段，最终 `ready/completed` 回调会让 backend
+把该侧完整性进度补为 100。
+
+## 5. 生命周期接口
+
+### `GET /health`
+
+```json
+{"status":"ok","node_role":"cloud"}
+```
+
+`node_role` 为 `edge` 或 `cloud`。backend 托管 cloud runtime 时依靠该接口确认进程就绪。
+
+### `GET /runtime_state`
+
+必须反映进程内真实状态，尤其是卸载完成后不能残留旧 `task_id` 或 `model_type`。
 
 ```json
 {
+  "node_role": "cloud",
+  "ready": true,
+  "draining": false,
   "task_id": "624a1db9-eaa0-4257-9a38-7d6469357048",
-  "status": "ready",
-  "progress": 100,
-  "message": "runtime is ready"
+  "model_type": "Llama-3.2-3B-Instruct",
+  "active_request_count": 0,
+  "last_used_at": 1710000000.0,
+  "server_param_digest": "...",
+  "partition_digest": "...",
+  "integrity_verified": true,
+  "confirmation_passed": true,
+  "runtime_route": {
+    "cloud_slot_id": "cloud-slot-0",
+    "cloud_decode_grpc_target": "10.144.144.4:51200"
+  }
 }
 ```
 
-说明：
-- 最终 `ready` 仍表示整个 runtime 已经就绪
-- 包括模型加载完成、完整性确认完成（如果启用 Aloepri）
+空闲且未加载模型时，`ready=false`、`draining=false`、`active_request_count=0`，并且
+`task_id`、`model_type`、`runtime_route` 均为 `null`。
 
----
+### `POST /unload_model`
 
-## 5. Aloepri 完整性确认回调
-
-若启用 Aloepri 完整性链路，cloud runtime 不再直接把确认发送到 edge runtime，而是优先通过 scheduler 中转：
-
-```http
-POST /api/v1/schedule/runtime/confirmation/cloud
+```json
+{"reason":"session closed"}
 ```
 
-### 请求体格式
+成功响应：
+
+```json
+{"unloaded":true,"reason":"session closed"}
+```
+
+卸载必须释放模型/执行器资源，并原子清除当前任务、模型、路由和完整性状态。加载尚未结束时返回 `409`。
+
+## 6. Aloepri 完整性确认
+
+cloud runtime 向 `runtime_route.scheduler_integrity_callback_url` 发送：
+
+```http
+Authorization: Bearer <RUNTIME_INTEGRITY_TOKEN>
+Content-Type: application/json
+```
 
 ```json
 {
   "task_id": "624a1db9-eaa0-4257-9a38-7d6469357048",
-  "cloud_slot_id": "cloud-slot-1",
-  "model_type": "Llama-3.2-3b",
+  "cloud_slot_id": "cloud-slot-0",
+  "model_type": "Llama-3.2-3B-Instruct",
   "server_param_digest": "...",
   "partition_digest": "...",
   "timestamp": 1710000000,
-  "nonce": "abc123"
+  "nonce": "unique-nonce"
 }
 ```
 
-scheduler 会再把这条确认中转到 edge runtime。
+backend 校验 token 和 slot 后，转发到 edge runtime：
 
----
+```text
+POST /integrity/cloud_confirmation
+```
 
-## 6. 职责边界
+转发同样使用共享的 `RUNTIME_INTEGRITY_TOKEN`。最终响应为：
 
-模型推理服务负责：
+```json
+{"matched":true,"reason":null}
+```
 
-- 接收 `/load_strategy`
-- 根据 `model_type` 启动正确模型
-- 加载切分策略
-- 使用 `runtime_route` 中的云端路由信息
-- 回调加载进度
-- 若启用 Aloepri，则完成完整性检验并触发确认回调
-- 对外维持类 OpenAI 推理入口
+## 7. 联调检查
 
-云端后端负责：
-
-- 任务受理
-- 资源检查
-- 调算法模块
-- 向模型推理服务下发策略
-- 聚合进度和维护任务状态
-- 中转 Aloepri 完整性确认
-- 管理云端 slot / binding / lifecycle
-
----
-
-## 7. 当前最关键的对接结论
-
-如果只记一件事，请记这句：
-
-**runtime 不应再只依赖固定 `DECODE_GRPC_TARGET`，而应优先使用 backend 下发的 `runtime_route.cloud_decode_grpc_target`；若启用 Aloepri，cloud runtime 的确认回调也应优先使用 `runtime_route.scheduler_integrity_callback_url`。**
+- `/health` 返回正确 `node_role`。
+- `/load_strategy` 在 5 秒内返回 `accepted` 或 `ok`。
+- edge 使用下发的 `cloud_decode_grpc_target`。
+- 回调使用原始 `task_id`，最终到达 100%。
+- `/runtime_state` 与实际加载、推理、卸载状态一致。
+- `/unload_model` 后不再返回旧任务 ID。
+- Aloepri 两端使用相同的 `RUNTIME_INTEGRITY_TOKEN`。

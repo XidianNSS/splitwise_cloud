@@ -8,6 +8,7 @@ import logging
 from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process_for_slot_locked, wait_for_slot_health
 from app.services.managed_cloud_slot_cleanup_service import prepare_managed_cloud_slot_for_start, stop_and_clear_managed_cloud_slot
 from app.services.runtime_slot_service import ensure_runtime_slot, update_runtime_slot_state
+from app.core.config import settings
 
 
 logger = logging.getLogger("ManagedCloudSlotBootstrap")
@@ -54,19 +55,44 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         return
 
     process_info = await start_decode_server_process_for_slot_locked("cloud-slot-0", 0)
-    health_ok = await wait_for_slot_health(process_info.control_url)
+    health_ok = await wait_for_slot_health(
+        process_info.control_url,
+        timeout_seconds=settings.CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS,
+        slot_id=process_info.slot_id,
+        process_pid=process_info.process_pid,
+    )
     if not health_ok:
         from app.services.decode_server_process_manager import stop_slot_process
-        stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
-        update_runtime_slot_state(
-            db,
-            slot,
-            process_state="failed",
-            slot_state="needs_reconcile",
-            model_state="failed",
-            process_pid=process_info.process_pid,
-        )
-        logger.error("cloud-slot-0 启动后健康检查失败，slot 已标记 failed/needs_reconcile")
+        stopped_ok = stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
+        failure_count = int(getattr(slot, "startup_failure_count", 0) or 0) + 1
+        if stopped_ok:
+            update_runtime_slot_state(
+                db,
+                slot,
+                process_state="stopped",
+                slot_state="free",
+                model_state="empty",
+                process_pid=None,
+                control_url=None,
+                grpc_target=None,
+                startup_deadline=None,
+                startup_failure_count=failure_count,
+                retry_after=None,
+                last_error="cloud-slot-0 backend bootstrap 健康检查失败",
+            )
+            logger.error("cloud-slot-0 启动后健康检查失败，进程已停止，后续调度可重新启动")
+        else:
+            update_runtime_slot_state(
+                db,
+                slot,
+                process_state="failed",
+                slot_state="needs_reconcile",
+                model_state="failed",
+                process_pid=process_info.process_pid,
+                startup_failure_count=failure_count,
+                last_error="cloud-slot-0 backend bootstrap 健康检查失败且进程无法停止",
+            )
+            logger.error("cloud-slot-0 启动后健康检查失败且进程无法停止，slot 已标记 failed/needs_reconcile")
         return
 
     slot = ensure_runtime_slot(
@@ -92,4 +118,8 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         model_type=None,
         task_id=None,
         process_idle_deadline=None,
+        startup_deadline=None,
+        startup_failure_count=0,
+        retry_after=None,
+        last_error=None,
     )

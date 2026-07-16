@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import suppress
 from datetime import datetime, timedelta
 
 import httpx
@@ -7,11 +10,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
-from app.services.decode_server_process_manager import inspect_slot_process
+from app.services.decode_server_process_manager import inspect_slot_process, stop_slot_process
 from app.services.managed_cloud_slot_cleanup_service import clear_slot_ownership, stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_slot_service import update_runtime_slot_state
 
+
+logger = logging.getLogger("RuntimeSlotReconcileService")
 
 _ACTIVE_TASK_STATUSES = {"accepted", "running"}
 _ACTIVE_TASK_PHASES = {"strategy", "loading", "completed"}
@@ -124,6 +129,70 @@ def _release_binding(db: Session, binding: RuntimeBinding | None) -> None:
         db.add(binding)
 
 
+def _startup_deadline_active(slot: RuntimeSlot) -> bool:
+    return slot.startup_deadline is not None and slot.startup_deadline > datetime.utcnow()
+
+
+def _recover_expired_cloud_startup(
+    db: Session,
+    slot: RuntimeSlot,
+    binding: RuntimeBinding | None,
+    task: ScheduleTask | None,
+    message: str,
+) -> RuntimeSlot:
+    expected_pid = slot.process_pid
+    if expected_pid is not None:
+        stop_slot_process(slot.slot_id, process_pid=expected_pid)
+    now = datetime.utcnow()
+    failure_count = int(slot.startup_failure_count or 0) + 1
+    delay = min(
+        settings.CLOUD_SLOT_STARTUP_BACKOFF_BASE_SECONDS * (2 ** max(0, failure_count - 1)),
+        settings.CLOUD_SLOT_STARTUP_BACKOFF_MAX_SECONDS,
+    )
+    if binding is not None and binding.cloud_slot_id == slot.slot_id:
+        binding.cloud_slot_id = None
+        binding.status = "pending"
+        binding.updated_at = now
+        db.add(binding)
+    if task is not None and _task_is_active(task):
+        task.status = "accepted"
+        task.phase = "loading"
+        task.queue_status = "waiting_cloud_slot"
+        task.queue_position = 0
+        task.cloud_slot_id = None
+        task.allocated_cloud_slot_id = None
+        task.spawned_cloud_slot = None
+        task.edge_status = "waiting"
+        task.cloud_status = "waiting"
+        task.message = message
+        task.edge_message = "等待可用的边端 runtime slot"
+        task.cloud_message = "cloud slot 启动失败，等待退避后重试"
+        task.updated_at = now
+        db.add(task)
+    slot = update_runtime_slot_state(
+        db,
+        slot,
+        process_state="stopped",
+        slot_state="free",
+        model_state="empty",
+        owner_session_id=None,
+        owner_binding_id=None,
+        model_type=None,
+        task_id=None,
+        process_pid=None,
+        control_url=None,
+        grpc_target=None,
+        startup_deadline=None,
+        startup_failure_count=failure_count,
+        retry_after=now + timedelta(seconds=delay),
+        last_error=message[:2000],
+        confirmation_status="none",
+        last_used_at=now,
+    )
+    db.commit()
+    return slot
+
+
 async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
     session = _get_session(db, slot.owner_session_id)
     binding = _get_binding(db, slot.owner_binding_id)
@@ -149,6 +218,25 @@ async def _reconcile_spawned_cloud_slot(db: Session, slot: RuntimeSlot) -> Runti
             process_alive = False
         else:
             process_alive = True
+
+    startup_loading = slot.process_state == "starting" and slot_active_loading
+    if startup_loading and slot.startup_deadline is None:
+        return update_runtime_slot_state(
+            db,
+            slot,
+            startup_deadline=datetime.utcnow() + timedelta(seconds=settings.CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS),
+            last_used_at=datetime.utcnow(),
+        )
+    if startup_loading and _startup_deadline_active(slot):
+        return slot
+    if startup_loading:
+        return _recover_expired_cloud_startup(
+            db,
+            slot,
+            binding,
+            task,
+            f"cloud slot {slot.slot_id} 启动超过 {settings.CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS:g} 秒，已退避重试",
+        )
 
     if not process_alive:
         if slot_active_loading:
@@ -445,13 +533,33 @@ async def reconcile_runtime_slot(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
     return await _reconcile_base_or_edge_slot(db, slot)
 
 
-async def reconcile_all_runtime_slots(db: Session) -> list[str]:
+async def reconcile_all_runtime_slots(
+    db: Session,
+    *,
+    failed_slots: list[dict[str, str]] | None = None,
+) -> list[str]:
+    """逐个对账 runtime slot，并隔离单个 slot 的意外异常。
+
+    常见的 runtime 网络异常由 ``reconcile_runtime_slot`` 转换为明确的 slot
+    状态。这里处理更外层的数据库、进程管理或实现异常，确保一个坏 slot
+    不会阻止后续 slot 被检查。
+    """
     slot_ids = [slot.slot_id for slot in db.query(RuntimeSlot).order_by(RuntimeSlot.slot_id.asc()).all()]
     reconciled: list[str] = []
     for slot_id in slot_ids:
-        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
-        if slot is None:
-            continue
-        await reconcile_runtime_slot(db, slot)
-        reconciled.append(slot_id)
+        try:
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if slot is None:
+                continue
+            await reconcile_runtime_slot(db, slot)
+            reconciled.append(slot_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            with suppress(Exception):
+                db.rollback()
+            error = f"{type(exc).__name__}: {exc}"[:512]
+            if failed_slots is not None:
+                failed_slots.append({"slot_id": slot_id, "error": error})
+            logger.exception("runtime slot 对账失败，已跳过当前 slot: slot_id=%s", slot_id)
     return reconciled

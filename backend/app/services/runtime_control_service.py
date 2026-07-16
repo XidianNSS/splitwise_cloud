@@ -32,6 +32,7 @@ async def unload_runtime_slot(
     *,
     reason: str,
     timeout: float = 10.0,
+    preserve_reservation: bool = False,
 ) -> dict:
     if not slot.control_url:
         raise RuntimeError(f"runtime slot {slot.slot_id} 缺少 control_url")
@@ -65,21 +66,34 @@ async def unload_runtime_slot(
     process_idle_deadline = None
     if bool(getattr(slot, "spawned_by_scheduler", 0)):
         process_idle_deadline = datetime.utcnow() + timedelta(seconds=settings.CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS)
-    update_runtime_slot_state(
-        db,
-        slot,
-        slot_state="free",
-        model_state="empty",
-        owner_session_id=None,
-        owner_binding_id=None,
-        model_type=None,
-        task_id=None,
-        active_request_count=0,
-        confirmation_status="none",
-        idle_deadline=idle_deadline,
-        process_idle_deadline=process_idle_deadline,
-        last_used_at=datetime.utcnow(),
-    )
+    if preserve_reservation:
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state="bound",
+            model_state="loading",
+            active_request_count=0,
+            confirmation_status="none",
+            idle_deadline=None,
+            process_idle_deadline=None,
+            last_used_at=datetime.utcnow(),
+        )
+    else:
+        update_runtime_slot_state(
+            db,
+            slot,
+            slot_state="free",
+            model_state="empty",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+            active_request_count=0,
+            confirmation_status="none",
+            idle_deadline=idle_deadline,
+            process_idle_deadline=process_idle_deadline,
+            last_used_at=datetime.utcnow(),
+        )
     return payload
 
 
