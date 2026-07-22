@@ -13,6 +13,10 @@
 4. backend 通过 `/runtime_state` 对账，并在释放资源时调用 `/unload_model`。
 5. 启用 Aloepri 时，cloud runtime 经 backend 把完整性确认转发给 edge runtime。
 
+当前 runtime 同时支持 Llama/Qwen 生成链路和 `BERT-Base-Uncased` 编码链路。
+BERT 的调度控制面、slot 和 callback 契约相同，但数据面使用 BERT RPC，且加载前
+必须完成 artifact fingerprint 与 partition digest 的跨节点确认。
+
 不使用 runtime 注册或注销接口。开发测试可启用 mock 配置，但正式服务与开发测试使用同一套协议。
 
 ## 2. 地址和端口
@@ -23,6 +27,7 @@ runtime 必须提供以下 HTTP 接口：
 |---|---|---|
 | `POST` | `/load_strategy` | 接收模型和切分策略 |
 | `GET` | `/health` | 进程健康检查 |
+| `GET` | `/integrity` | 查询 artifact、partition 和确认状态 |
 | `GET` | `/runtime_state` | 返回真实生命周期状态 |
 | `POST` | `/unload_model` | 卸载当前模型并清除任务身份 |
 
@@ -71,7 +76,9 @@ Content-Type: application/json
 
 - `task_id`：本次加载的唯一任务 ID；后续回调必须原样携带。
 - `model_type`：传给 ModelSplit runtime 的规范模型名。
-- `decision.layer_partitions`：逐层切分结果；head/FFN 中 `0` 表示 edge，`1` 表示 cloud，FFN 还允许 `2` 表示拆分。
+- `decision.layer_partitions`：逐层切分结果；head/FFN 中 `0` 表示 edge，`1` 表示 cloud。当前 ModelSplit `PartitionConfig` 不接受 FFN 值 `2`。
+- BERT 固定发送 12 层、每层 12 个值为 `1` 的 `head_assignments`，
+  `ffn_assignment=1`；这是 runtime 协议载体，不是算法计算结果。
 - `runtime_route.cloud_slot_id`：本次分配的 cloud slot。
 - `runtime_route.cloud_decode_grpc_target`：edge prefill/coordinator 应连接的 decode gRPC 地址。
 - `runtime_route.scheduler_integrity_callback_url`：cloud runtime 的完整性确认回调地址。
@@ -117,9 +124,16 @@ runtime 正在加载其他任务时应返回 `409`；请求或模型非法可返
 - `stage`：`runtime_load` 或 `integrity`；省略时按 `runtime_load` 处理。
 - `node_role`：使用上述带角色路径时无需传递。
 
+所有进度回调必须携带：
+
+```http
+Authorization: Bearer <RUNTIME_INTEGRITY_TOKEN>
+```
+
 加载成功必须以 `ready` 或 `completed`、`progress=100` 结束。加载失败使用
-`status=failed`，并在 `message` 中给出可定位的原因。当前进度回调接口不校验
-Bearer token，只应暴露在可信内网。
+`status=failed`，并在 `message` 中给出可定位的原因。缺少或错误 token 返回 `401`；
+backend 未配置 token 返回 `503`。backend 会同时校验 task、active session、binding、slot
+和 model 所有权。旧 allocation 的迟到回调按幂等成功返回，但不会改变当前 slot 或任务。
 
 如果 runtime 没有单独上报 `integrity` 阶段，最终 `ready/completed` 回调会让 backend
 把该侧完整性进度补为 100。
@@ -137,6 +151,8 @@ Bearer token，只应暴露在可信内网。
 ### `GET /runtime_state`
 
 必须反映进程内真实状态，尤其是卸载完成后不能残留旧 `task_id` 或 `model_type`。
+edge 的 ready 保温状态还必须包含完整 `runtime_route`，且指向的 cloud slot、控制地址、
+gRPC 地址、模型和 task 均与一个健康 ready cloud runtime 一致；缺失或无法验证时按不健康处理。
 
 ```json
 {
@@ -161,6 +177,10 @@ Bearer token，只应暴露在可信内网。
 空闲且未加载模型时，`ready=false`、`draining=false`、`active_request_count=0`，并且
 `task_id`、`model_type`、`runtime_route` 均为 `null`。
 
+### `GET /integrity`
+
+用于排查 Aloepri/BERT 的 artifact fingerprint、server parameter digest、partition digest 和 cloud confirmation。它不是普通存活探针；backend 的所有权对账仍以 `/runtime_state` 为主。
+
 ### `POST /unload_model`
 
 ```json
@@ -175,7 +195,7 @@ Bearer token，只应暴露在可信内网。
 
 卸载必须释放模型/执行器资源，并原子清除当前任务、模型、路由和完整性状态。加载尚未结束时返回 `409`。
 
-## 6. Aloepri 完整性确认
+## 6. Aloepri/BERT 完整性确认
 
 cloud runtime 向 `runtime_route.scheduler_integrity_callback_url` 发送：
 
@@ -208,12 +228,14 @@ POST /integrity/cloud_confirmation
 {"matched":true,"reason":null}
 ```
 
+BERT 使用同一确认拓扑，但 digest 来源不同：正常 BERT 校验 `config.json + model.safetensors` bundle，混淆 BERT 校验部署 artifact fingerprint；两侧还必须匹配 partition digest。正式注册表按角色隔离：prefill 可持有 `client_secret`，decode 只持有 `server_dir`/artifact fingerprint，coordinator/OpenAI 不得包含 `encrypted_model`。
+
 ## 7. 联调检查
 
 - `/health` 返回正确 `node_role`。
 - `/load_strategy` 在 5 秒内返回 `accepted` 或 `ok`。
 - edge 使用下发的 `cloud_decode_grpc_target`。
-- 回调使用原始 `task_id`，最终到达 100%。
+- 回调使用原始 `task_id`，携带共享 Bearer token，最终到达 100%。
 - `/runtime_state` 与实际加载、推理、卸载状态一致。
 - `/unload_model` 后不再返回旧任务 ID。
-- Aloepri 两端使用相同的 `RUNTIME_INTEGRITY_TOKEN`。
+- Aloepri/BERT 两端与 backend 使用相同的 `RUNTIME_INTEGRITY_TOKEN`。

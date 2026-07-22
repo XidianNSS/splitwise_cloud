@@ -19,10 +19,14 @@ import sys
 sys.path.insert(0, str(ROOT / "backend"))
 
 from app.db.database import Base, SessionLocal, engine
-from app.models.models import Device, RuntimeBinding, RuntimeSlot, ScheduleTask
+from app.models.models import Device, EdgeSession, RuntimeBinding, RuntimeSlot, ScheduleTask
 from app.services.decode_server_process_manager import _SLOT_PROCESSES, stop_slot_process
 from app.services.runtime_slot_reconcile_service import reconcile_runtime_slot
-from app.services.runtime_slot_service import ensure_runtime_slot, update_runtime_slot_state
+from app.services.runtime_slot_service import ensure_runtime_slot
+from app.services.runtime_state_transition_service import (
+    RuntimeTransitionConflict,
+    transition_runtime_slot,
+)
 from app.services.schedule_orchestrator import (
     RuntimeSlotCapacityUnavailable,
     _reserve_edge_slot_for_task,
@@ -42,6 +46,21 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
     def _add_task(self, task_id: str, binding_id: str, session_id: str) -> None:
         db = SessionLocal()
         try:
+            now = datetime.utcnow()
+            db.add(EdgeSession(
+                session_id=session_id,
+                openwebui_user_id="user",
+                edge_device_id="edge-device",
+                edge_ip="127.0.0.1",
+                cloud_device_id="cloud",
+                model_type="Llama-3.2-3B-Instruct",
+                status="active",
+                created_at=now,
+                updated_at=now,
+                last_active_at=now,
+                expires_at=now + timedelta(hours=2),
+                lease_expires_at=now + timedelta(hours=2),
+            ))
             db.add(RuntimeBinding(
                 binding_id=binding_id,
                 session_id=session_id,
@@ -67,6 +86,60 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
             db.commit()
         finally:
             db.close()
+
+    def test_stale_slot_snapshot_cannot_overwrite_new_allocation(self) -> None:
+        setup_db = SessionLocal()
+        try:
+            ensure_runtime_slot(
+                setup_db,
+                slot_id="edge-slot-shared",
+                role="edge",
+                process_state="running",
+            )
+        finally:
+            setup_db.close()
+
+        stale_db = SessionLocal()
+        owner_db = SessionLocal()
+        try:
+            stale_slot = stale_db.query(RuntimeSlot).filter(
+                RuntimeSlot.slot_id == "edge-slot-shared"
+            ).one()
+            current_slot = owner_db.query(RuntimeSlot).filter(
+                RuntimeSlot.slot_id == "edge-slot-shared"
+            ).one()
+            transition_runtime_slot(
+                owner_db,
+                current_slot,
+                slot_state="bound",
+                model_state="loading",
+                owner_session_id="session-new",
+                owner_binding_id="binding-new",
+                task_id="task-new",
+                model_type="Llama-3.2-3B-Instruct",
+            )
+
+            with self.assertRaises(RuntimeTransitionConflict):
+                transition_runtime_slot(
+                    stale_db,
+                    stale_slot,
+                    slot_state="free",
+                    model_state="empty",
+                )
+        finally:
+            stale_db.close()
+            owner_db.close()
+
+        verify_db = SessionLocal()
+        try:
+            slot = verify_db.query(RuntimeSlot).filter(
+                RuntimeSlot.slot_id == "edge-slot-shared"
+            ).one()
+            self.assertEqual(slot.owner_binding_id, "binding-new")
+            self.assertEqual(slot.task_id, "task-new")
+            self.assertEqual(slot.slot_state, "bound")
+        finally:
+            verify_db.close()
 
     def test_stopped_slot_is_reserved_before_startup_await(self) -> None:
         db = SessionLocal()
@@ -164,7 +237,7 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
                     spawned_by_scheduler=True,
                     process_state="running",
                 )
-                update_runtime_slot_state(db, slot, slot_state="free", model_state="empty")
+                transition_runtime_slot(db, slot, slot_state="free", model_state="empty")
         finally:
             db.close()
         for index in range(3):
@@ -273,7 +346,7 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
                 spawned_by_scheduler=True,
                 process_state="stopped",
             )
-            update_runtime_slot_state(
+            transition_runtime_slot(
                 db,
                 backed_off,
                 slot_state="free",
@@ -292,7 +365,7 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
                 spawned_by_scheduler=True,
                 process_state="running",
             )
-            update_runtime_slot_state(db, healthy, slot_state="free", model_state="empty")
+            transition_runtime_slot(db, healthy, slot_state="free", model_state="empty")
             task = db.query(ScheduleTask).filter(ScheduleTask.task_id == "task-1").one()
             slot, spawned = asyncio.run(allocate_cloud_slot_for_task(db, task))
             self.assertEqual(slot.slot_id, "cloud-slot-1")
@@ -313,7 +386,25 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
                     control_url=f"http://127.0.0.1:{9000 + index}/load_strategy",
                     process_state="running",
                 )
-                update_runtime_slot_state(db, slot, slot_state="free", model_state="empty")
+                if index == 1:
+                    binding = db.query(RuntimeBinding).filter(
+                        RuntimeBinding.binding_id == "binding-1"
+                    ).one()
+                    binding.status = "binding"
+                    transition_runtime_slot(
+                        db,
+                        slot,
+                        slot_state="bound",
+                        model_state="loading",
+                        owner_session_id="session-1",
+                        owner_binding_id="binding-1",
+                        task_id="task-1",
+                        model_type="Llama-3.2-3B-Instruct",
+                    )
+                    db.add(binding)
+                    db.commit()
+                else:
+                    transition_runtime_slot(db, slot, slot_state="free", model_state="empty")
         finally:
             db.close()
 
@@ -406,7 +497,7 @@ class ConcurrentSlotReservationTest(unittest.TestCase):
                 spawned_by_scheduler=True,
                 process_state="starting",
             )
-            slot = update_runtime_slot_state(
+            slot = transition_runtime_slot(
                 db,
                 slot,
                 process_state="starting",

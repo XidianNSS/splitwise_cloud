@@ -2,6 +2,10 @@
 
 本文描述当前 `splitwise_cloud/backend` 与切分策略算法服务之间的 HTTP 协议。
 
+该协议只用于 `strategy_kind=algorithm` 的生成模型。`BERT-Base-Uncased`
+是 encoder-only 模型，backend 为它生成固定 12 层协议，不会调用算法服务；
+算法服务无需适配 BERT。
+
 ## 1. 调用方式
 
 backend 对算法服务发起一次同步 HTTP 请求：
@@ -95,10 +99,10 @@ http://10.144.144.6:8050/infer
 
 当前支持的模型键为：
 
-- `gpt2`
-- `tinyllama`
 - `Llama-3.2-3b`
 - `Llama-3.2-3B-Instruct`
+
+这两种 Llama 3B 会调用算法服务。BERT 使用固定 encoder 策略，不会调用本接口；DeepSeek/Meta-Llama 尚未加入 scheduler，因此当前也不会发到算法服务。
 
 ### `env.edge` 和 `env.cloud`
 
@@ -144,11 +148,13 @@ HTTP 状态必须为 2xx，body 必须是 JSON：
 - `layer_partitions`：非空数组，是唯一必需的策略结果。
 - `layer_id`：层编号。
 - `head_assignments`：每个 attention head 的归属；`0=edge`，`1=cloud`。
-- `ffn_assignment`：`0=edge`，`1=cloud`，`2=拆分`。
+- `ffn_assignment`：`0=edge`，`1=cloud`。虽然 backend 当前只做整数规范化，但下游 ModelSplit `PartitionConfig` 不接受值 `2`，算法服务不得返回 `2`。
 - `edge_heads`、`cloud_heads`：可选。省略时 backend 根据 `head_assignments` 计算；提供时必须与其一致。
 
 推荐每个模型返回完整层数，并保证每层的 `head_assignments` 长度等于
 `num_attention_heads`。backend 会把上述数字转换为整数，但算法服务仍应主动校验范围、层数和 head 数，避免生成可解析但无法执行的策略。
+
+当前 backend 不会在保存前完整验证 layer 连续性、head 取值范围和 FFN 取值范围；这些错误会在 ModelSplit `/load_strategy` 阶段被拒绝并使任务失败。因此算法服务必须保证 `layer_id` 从 0 连续递增、head 仅为 `0/1`、FFN 仅为 `0/1`。
 
 ## 4. 失败响应
 

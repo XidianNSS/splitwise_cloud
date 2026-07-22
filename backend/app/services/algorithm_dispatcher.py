@@ -4,7 +4,11 @@ import logging
 import httpx
 
 from app.core.config import settings
-from app.services.model_registry import MODEL_REGISTRY
+from app.services.model_registry import (
+    MODEL_REGISTRY,
+    build_fixed_runtime_decision,
+    uses_fixed_runtime_strategy,
+)
 
 logger = logging.getLogger("AlgorithmDispatcher")
 
@@ -139,3 +143,21 @@ async def request_algorithm_decision(task_id: str, model_type: str, raw_input_js
         json.dumps(decision_result, ensure_ascii=False),
     )
     return decision_result
+
+
+async def resolve_runtime_decision(
+    task_id: str,
+    model_type: str,
+    model_type_key: str,
+    raw_input_json: dict,
+) -> dict:
+    """Resolve either a deterministic protocol or an algorithm decision."""
+    if uses_fixed_runtime_strategy(model_type_key):
+        decision = build_fixed_runtime_decision(model_type, model_type_key)
+        logger.info(
+            "使用固定 runtime 协议，跳过切分算法服务: task_id=%s model=%s",
+            task_id,
+            model_type,
+        )
+        return decision
+    return await request_algorithm_decision(task_id, model_type, raw_input_json)

@@ -17,35 +17,12 @@ load_dotenv(ENV_FILE)
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8010")
 RUNTIME_CALLBACK_URL = f"{BACKEND_BASE_URL}/api/v1/schedule/runtime_callback/edge"
+RUNTIME_INTEGRITY_TOKEN = os.getenv("RUNTIME_INTEGRITY_TOKEN", "").strip()
 EDGE_RUNTIME_USE_MOCK = os.getenv("EDGE_RUNTIME_USE_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
 RUNTIME_PORT = int(os.getenv("EDGE_RUNTIME_MOCK_PORT", os.getenv("EDGE_RUNTIME_PORT", "7001")))
 STEP_DELAY_SECONDS = float(os.getenv("EDGE_RUNTIME_STEP_DELAY_SECONDS", "2.5"))
 
 MODEL_PROFILES = {
-    "gpt2": {
-        "display_name": "GPT-2",
-        "checkpoints": [
-            (10, "边端已接收 GPT-2 策略，开始准备加载"),
-            (25, "边端正在校验 GPT-2 切分配置"),
-            (40, "边端正在加载 GPT-2 权重"),
-            (60, "边端正在初始化 GPT-2 推理上下文"),
-            (80, "边端正在预热 GPT-2 运行环境"),
-            (92, "边端 GPT-2 即将就绪"),
-            (100, "边端 GPT-2 加载完成"),
-        ],
-    },
-    "tinyllama": {
-        "display_name": "TinyLlama",
-        "checkpoints": [
-            (12, "边端已接收 TinyLlama 策略，开始准备加载"),
-            (28, "边端正在校验 TinyLlama 切分配置"),
-            (45, "边端正在加载 TinyLlama 权重"),
-            (62, "边端正在初始化 TinyLlama 推理上下文"),
-            (82, "边端正在预热 TinyLlama 运行环境"),
-            (94, "边端 TinyLlama 即将就绪"),
-            (100, "边端 TinyLlama 加载完成"),
-        ],
-    },
     "llama-3.2-3b": {
         "display_name": "Llama-3.2-3b",
         "checkpoints": [
@@ -99,6 +76,7 @@ async def simulate_loading(task_id: str, model_type: str):
             await asyncio.sleep(STEP_DELAY_SECONDS)
             await client.post(
                 RUNTIME_CALLBACK_URL,
+                headers={"Authorization": f"Bearer {RUNTIME_INTEGRITY_TOKEN}"},
                 json={
                     "task_id": task_id,
                     "status": "ready" if progress == 100 else "loading",

@@ -7,7 +7,8 @@ import logging
 
 from app.services.decode_server_process_manager import current_runtime_env_metadata, start_decode_server_process_for_slot_locked, wait_for_slot_health
 from app.services.managed_cloud_slot_cleanup_service import prepare_managed_cloud_slot_for_start, stop_and_clear_managed_cloud_slot
-from app.services.runtime_slot_service import ensure_runtime_slot, update_runtime_slot_state
+from app.services.runtime_slot_service import ensure_runtime_slot
+from app.services.runtime_state_transition_service import transition_runtime_slot
 from app.core.config import settings
 
 
@@ -66,7 +67,7 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         stopped_ok = stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
         failure_count = int(getattr(slot, "startup_failure_count", 0) or 0) + 1
         if stopped_ok:
-            update_runtime_slot_state(
+            transition_runtime_slot(
                 db,
                 slot,
                 process_state="stopped",
@@ -82,7 +83,7 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
             )
             logger.error("cloud-slot-0 启动后健康检查失败，进程已停止，后续调度可重新启动")
         else:
-            update_runtime_slot_state(
+            transition_runtime_slot(
                 db,
                 slot,
                 process_state="failed",
@@ -107,7 +108,7 @@ async def bootstrap_managed_cloud_slots(db: Session) -> None:
         base_env_name=env_file_name,
         process_pid=process_info.process_pid,
     )
-    update_runtime_slot_state(
+    transition_runtime_slot(
         db,
         slot,
         process_state="running",

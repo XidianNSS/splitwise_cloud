@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import uuid
+import weakref
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import httpx
@@ -13,12 +15,13 @@ from app.models.models import Device, EdgeSession, RuntimeBinding, RuntimeSlot, 
 from app.services.algorithm_dispatcher import (
     build_algorithm_request_payload,
     derive_edge_storage_limit_gb_from_metrics,
-    request_algorithm_decision,
+    resolve_runtime_decision,
 )
 from app.services.model_registry import (
     canonicalize_model_type,
     resolve_model_type_key,
     runtime_model_type,
+    uses_fixed_runtime_strategy,
 )
 from app.services.network_probe import get_network_metrics
 from app.services.prometheus_metrics import get_prometheus_metrics
@@ -31,12 +34,17 @@ from app.services.decode_server_process_manager import current_runtime_env_metad
 from app.services.runtime_startup_admission import check_runtime_startup_resources
 from app.services.schedule_presenter import clamp_progress
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
-from app.services.runtime_binding_service import create_runtime_binding, update_runtime_binding
+from app.services.runtime_binding_service import create_runtime_binding
 from app.services.runtime_slot_service import (
     ensure_runtime_slot,
     get_cloud_slot_by_id,
     list_cloud_slots,
-    update_runtime_slot_state,
+)
+from app.services.runtime_state_transition_service import (
+    RuntimeAllocationIdentity,
+    RuntimeTransitionConflict,
+    transition_runtime_binding,
+    transition_runtime_slot,
 )
 from app.services.session_lease_service import refresh_session_lease
 from app.services.schedule_queue import (
@@ -55,9 +63,17 @@ TASK_TERMINAL_STATUSES = {"completed", "failed"}
 STRATEGY_ADMISSION_LOCK = asyncio.Lock()
 CLOUD_SLOT_ALLOCATION_LOCK = asyncio.Lock()
 LOADING_PROMOTION_LOCK = asyncio.Lock()
+_SCHEDULE_EFFECT_LOCKS_BY_LOOP: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 logger = logging.getLogger("ScheduleOrchestrator")
 RUNTIME_APP_ENV, RUNTIME_ENV_FILE = current_runtime_env_metadata()
+
+
+def get_schedule_effect_lock(session_id: str) -> asyncio.Lock:
+    """Return the per-session lock that linearizes runtime dispatch and close."""
+    loop = asyncio.get_running_loop()
+    locks = _SCHEDULE_EFFECT_LOCKS_BY_LOOP.setdefault(loop, {})
+    return locks.setdefault(session_id, asyncio.Lock())
 
 
 def _scheduler_confirmation_callback_url() -> str:
@@ -94,20 +110,6 @@ def _list_session_owned_cloud_slots(db: Session, session_id: str) -> list[Runtim
     )
 
 
-def _get_reclaimable_retained_cloud_slot(db: Session) -> RuntimeSlot | None:
-    return (
-        db.query(RuntimeSlot)
-        .filter(
-            RuntimeSlot.role == "cloud",
-            RuntimeSlot.process_state == "running",
-            RuntimeSlot.slot_state == "retained",
-            RuntimeSlot.model_state == "ready",
-        )
-        .order_by(RuntimeSlot.idle_deadline.asc(), RuntimeSlot.updated_at.asc(), RuntimeSlot.slot_index.asc())
-        .first()
-    )
-
-
 def _get_session_owned_edge_slot(db: Session, session_id: str) -> RuntimeSlot | None:
     return (
         db.query(RuntimeSlot)
@@ -138,10 +140,6 @@ def _select_authoritative_session_binding(db: Session, session_id: str) -> Runti
     )
 
 
-def find_active_session_runtime_binding(db: Session, session_id: str) -> RuntimeBinding | None:
-    return _select_authoritative_session_binding(db, session_id)
-
-
 def _get_session_reload_target(db: Session, session_id: str) -> tuple[RuntimeBinding | None, RuntimeSlot | None, RuntimeSlot | None]:
     edge_slot = _get_session_owned_edge_slot(db, session_id)
     binding = _select_authoritative_session_binding(db, session_id)
@@ -164,15 +162,6 @@ def _get_session_reload_target(db: Session, session_id: str) -> tuple[RuntimeBin
         cloud_slot = owned_cloud_slots[0] if owned_cloud_slots else None
 
     return binding, edge_slot, cloud_slot
-
-
-def find_active_session_cloud_slot(db: Session, session_id: str) -> RuntimeSlot | None:
-    binding, _edge_slot, cloud_slot = _get_session_reload_target(db, session_id)
-    if binding is None or cloud_slot is None:
-        return None
-    if cloud_slot.owner_session_id != session_id and cloud_slot.owner_binding_id != binding.binding_id:
-        return None
-    return cloud_slot
 
 
 def _session_slots_busy_for_new_load(edge_slot: RuntimeSlot | None, cloud_slot: RuntimeSlot | None) -> bool:
@@ -199,81 +188,115 @@ def _runtime_state_is_busy(state: dict) -> bool:
     return bool(state.get("draining")) or int(state.get("active_request_count") or 0) > 0
 
 
-async def _reclaim_retained_runtime_slot(
-    db: Session,
-    slot: RuntimeSlot,
-    *,
-    reason: str,
-) -> RuntimeSlot:
-    try:
-        state = await fetch_runtime_state(slot)
-    except Exception as exc:
-        _mark_slot_needs_reconcile_with_owner(
-            db,
-            slot,
-            owner_session_id=slot.owner_session_id,
-            owner_binding_id=slot.owner_binding_id,
-            task_id=slot.task_id,
-            model_type=slot.model_type,
-        )
-        raise RuntimeError(f"{slot.slot_id} runtime_state 获取失败，不能安全复用 retained slot: {exc}") from exc
-
-    if _runtime_state_is_busy(state):
-        raise RuntimeError(f"{slot.slot_id} 仍有活跃推理或正在卸载，不能复用 retained slot")
-
-    if _runtime_state_has_loaded_model(state):
-        try:
-            await unload_runtime_slot(db, slot, reason=reason)
-        except Exception as exc:
-            _mark_slot_needs_reconcile_with_owner(
-                db,
-                slot,
-                owner_session_id=slot.owner_session_id,
-                owner_binding_id=slot.owner_binding_id,
-                task_id=slot.task_id,
-                model_type=slot.model_type,
-            )
-            raise RuntimeError(f"{slot.slot_id} retained 模型卸载失败，不能复用该 slot") from exc
-
-    refreshed = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
-    if refreshed is None:
-        raise RuntimeError(f"{slot.slot_id} retained slot 回收后记录丢失")
-    return update_runtime_slot_state(
-        db,
-        refreshed,
-        process_state="running",
-        slot_state="free",
-        model_state="empty",
-        owner_session_id=None,
-        owner_binding_id=None,
-        task_id=None,
-        model_type=None,
-        active_request_count=0,
-        idle_deadline=None,
-        process_idle_deadline=None,
-        confirmation_status="none",
-        last_used_at=datetime.utcnow(),
-    )
-
-
-async def _prepare_edge_slot_for_task(db: Session, edge_slot: RuntimeSlot, task: ScheduleTask) -> RuntimeSlot:
-    if edge_slot.slot_state != "retained" and not (
-        edge_slot.model_state == "ready"
-        and edge_slot.owner_binding_id is None
-        and edge_slot.owner_session_id is None
-    ):
-        return edge_slot
-    return await _reclaim_retained_runtime_slot(
-        db,
-        edge_slot,
-        reason=f"task {task.task_id} reclaim retained edge slot {edge_slot.slot_id}",
-    )
-
-
 def _models_equal(left: str | None, right: str | None) -> bool:
     if not left or not right:
         return False
     return canonicalize_model_type(left) == canonicalize_model_type(right)
+
+
+@dataclass(frozen=True)
+class ScheduleTaskLeaseContext:
+    task: ScheduleTask
+    session: EdgeSession
+    binding: RuntimeBinding
+
+
+def resolve_current_schedule_task(
+    db: Session,
+    *,
+    task_id: str,
+) -> tuple[ScheduleTaskLeaseContext | None, str]:
+    """Resolve a task whose session and binding still authorize side effects."""
+    db.expire_all()
+    task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+    if task is None:
+        return None, "task not found"
+    if task.status in TASK_TERMINAL_STATUSES or task.queue_status == "done":
+        return None, f"task is terminal: {task.status}"
+    if task.status not in {"accepted", "running"}:
+        return None, f"task status is not active: {task.status}"
+
+    session = (
+        db.query(EdgeSession)
+        .filter(EdgeSession.session_id == task.edge_session_id)
+        .first()
+    )
+    if session is None or session.status != "active":
+        return None, "session is not active"
+    if not _models_equal(session.model_type, task.model_type):
+        return None, "session model no longer matches the task"
+
+    binding = _find_binding(db, task.runtime_binding_id)
+    if binding is None:
+        return None, "runtime binding not found"
+    if (
+        binding.status not in {"pending", "binding"}
+        or binding.task_id != task.task_id
+        or binding.session_id != task.edge_session_id
+    ):
+        return None, "runtime binding is no longer authoritative"
+    return ScheduleTaskLeaseContext(task, session, binding), ""
+
+
+@dataclass(frozen=True)
+class RuntimeAllocationContext:
+    task: ScheduleTask
+    session: EdgeSession
+    binding: RuntimeBinding
+    slot: RuntimeSlot
+
+
+def resolve_current_runtime_allocation(
+    db: Session,
+    *,
+    task_id: str,
+    node_role: str,
+) -> tuple[RuntimeAllocationContext | None, str]:
+    """Resolve the authoritative loading allocation for a runtime callback."""
+    role = node_role.strip().lower()
+    if role not in {"edge", "cloud"}:
+        return None, "invalid node role"
+
+    lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+    if lease is None:
+        return None, lease_reason
+    task = lease.task
+    if (
+        task.status != "running"
+        or task.phase != "loading"
+        or task.queue_status != LOADING_RUNNING_STATUS
+    ):
+        return None, (
+            "task is not the active loading allocation: "
+            f"status={task.status} phase={task.phase} queue_status={task.queue_status}"
+        )
+
+    session = lease.session
+    binding = lease.binding
+    if binding.status != "binding":
+        return None, "runtime binding is no longer authoritative"
+
+    slot_id = task.edge_slot_id if role == "edge" else task.cloud_slot_id
+    binding_slot_id = binding.edge_slot_id if role == "edge" else binding.cloud_slot_id
+    if not slot_id or slot_id != binding_slot_id:
+        return None, "task and binding slot mapping do not match"
+    if role == "cloud" and task.allocated_cloud_slot_id != slot_id:
+        return None, "allocated cloud slot no longer matches the task"
+
+    slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+    if slot is None or slot.role != role:
+        return None, "runtime slot not found or role mismatch"
+    if (
+        slot.slot_state != "bound"
+        or slot.task_id != task.task_id
+        or slot.owner_binding_id != binding.binding_id
+        or slot.owner_session_id != task.edge_session_id
+    ):
+        return None, "runtime slot ownership no longer matches the task"
+    if not _models_equal(slot.model_type, task.model_type):
+        return None, "runtime slot model no longer matches the task"
+
+    return RuntimeAllocationContext(task, session, binding, slot), ""
 
 
 def _is_runtime_loading_conflict(exc: Exception) -> bool:
@@ -333,7 +356,7 @@ def _mark_slot_needs_reconcile_with_owner(
     task_id: str | None,
     model_type: str | None,
 ) -> RuntimeSlot:
-    return update_runtime_slot_state(
+    return transition_runtime_slot(
         db,
         slot,
         process_state="failed",
@@ -365,13 +388,15 @@ def _release_non_authoritative_session_bindings(
         .all()
     )
     updated = False
-    now = datetime.utcnow()
     for binding in bindings:
         if keep_binding_id and binding.binding_id == keep_binding_id:
             continue
-        binding.status = "released"
-        binding.updated_at = now
-        db.add(binding)
+        transition_runtime_binding(
+            db,
+            binding,
+            status="released",
+            commit=False,
+        )
         updated = True
     if updated:
         db.commit()
@@ -440,7 +465,7 @@ async def _reload_session_owned_slots_for_task(
         _mark_slot_needs_reconcile_with_owner(db, cloud_slot, **old_owner)
         raise RuntimeError("当前会话原有 edge slot 卸载失败，无法重新加载模型") from exc
 
-    update_runtime_binding(db, old_binding, status="released")
+    transition_runtime_binding(db, old_binding, status="released")
     _release_non_authoritative_session_bindings(db, task.edge_session_id, keep_binding_id=new_binding.binding_id)
 
     refreshed_edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == edge_slot.slot_id).first()
@@ -453,65 +478,57 @@ def _slot_retry_ready(slot: RuntimeSlot, now: datetime) -> bool:
     return retry_after is None or retry_after <= now
 
 
-def _same_value_filter(query, column, value):
-    return query.filter(column.is_(None) if value is None else column == value)
-
-
 def _reserve_cloud_slot(
     db: Session,
     task: ScheduleTask,
     slot: RuntimeSlot,
 ) -> RuntimeSlot | None:
     """以条件 UPDATE 抢占 slot，并在同一事务写入 task/binding 的真实映射。"""
-    binding = _find_binding(db, task.runtime_binding_id)
-    if binding is None:
-        raise RuntimeError(f"task {task.task_id} 缺少 runtime binding")
+    lease, _ = resolve_current_schedule_task(db, task_id=task.task_id)
+    if lease is None:
+        return None
+    task = lease.task
+    binding = lease.binding
 
     now = datetime.utcnow()
     needs_start = slot.process_state == "stopped"
-    query = db.query(RuntimeSlot).filter(
-        RuntimeSlot.slot_id == slot.slot_id,
-        RuntimeSlot.process_state == slot.process_state,
-        RuntimeSlot.slot_state == slot.slot_state,
-        RuntimeSlot.model_state == slot.model_state,
-    )
-    query = _same_value_filter(query, RuntimeSlot.owner_session_id, slot.owner_session_id)
-    query = _same_value_filter(query, RuntimeSlot.owner_binding_id, slot.owner_binding_id)
-    query = _same_value_filter(query, RuntimeSlot.task_id, slot.task_id)
-    updated = query.update(
-        {
-            RuntimeSlot.process_state: "starting" if needs_start else "running",
-            RuntimeSlot.slot_state: "bound",
-            RuntimeSlot.model_state: "loading",
-            RuntimeSlot.owner_session_id: task.edge_session_id,
-            RuntimeSlot.owner_binding_id: binding.binding_id,
-            RuntimeSlot.task_id: task.task_id,
-            RuntimeSlot.model_type: task.model_type,
-            RuntimeSlot.active_request_count: 0,
-            RuntimeSlot.confirmation_status: "pending",
-            RuntimeSlot.idle_deadline: None,
-            RuntimeSlot.process_idle_deadline: None,
-            RuntimeSlot.startup_deadline: (
+    try:
+        transition_runtime_slot(
+            db,
+            slot,
+            process_state="starting" if needs_start else "running",
+            slot_state="bound",
+            model_state="loading",
+            owner_session_id=task.edge_session_id,
+            owner_binding_id=binding.binding_id,
+            task_id=task.task_id,
+            model_type=task.model_type,
+            active_request_count=0,
+            confirmation_status="pending",
+            idle_deadline=None,
+            process_idle_deadline=None,
+            startup_deadline=(
                 now + timedelta(seconds=settings.CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS)
                 if needs_start
                 else None
             ),
-            RuntimeSlot.last_error: None,
-            RuntimeSlot.updated_at: now,
-        },
-        synchronize_session=False,
-    )
-    if updated != 1:
-        db.rollback()
+            last_error=None,
+            commit=False,
+        )
+        transition_runtime_binding(
+            db,
+            binding,
+            cloud_slot_id=slot.slot_id,
+            status="binding",
+            commit=False,
+        )
+    except RuntimeTransitionConflict:
         return None
 
-    binding.cloud_slot_id = slot.slot_id
-    binding.status = "binding"
-    binding.updated_at = now
     task.cloud_slot_id = slot.slot_id
     task.allocated_cloud_slot_id = slot.slot_id
     task.updated_at = now
-    db.add_all([binding, task])
+    db.add(task)
     db.commit()
     db.expire_all()
     return db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
@@ -530,37 +547,52 @@ def _mark_cloud_slot_startup_failed(
         settings.CLOUD_SLOT_STARTUP_BACKOFF_BASE_SECONDS * (2 ** max(0, failure_count - 1)),
         settings.CLOUD_SLOT_STARTUP_BACKOFF_MAX_SECONDS,
     )
-    db.query(RuntimeSlot).filter(
-        RuntimeSlot.slot_id == slot.slot_id,
-        RuntimeSlot.owner_binding_id == task.runtime_binding_id,
-        RuntimeSlot.task_id == task.task_id,
-    ).update(
-        {
-            RuntimeSlot.process_state: "stopped",
-            RuntimeSlot.slot_state: "free",
-            RuntimeSlot.model_state: "empty",
-            RuntimeSlot.owner_session_id: None,
-            RuntimeSlot.owner_binding_id: None,
-            RuntimeSlot.model_type: None,
-            RuntimeSlot.task_id: None,
-            RuntimeSlot.process_pid: None,
-            RuntimeSlot.control_url: None,
-            RuntimeSlot.grpc_target: None,
-            RuntimeSlot.startup_deadline: None,
-            RuntimeSlot.startup_failure_count: failure_count,
-            RuntimeSlot.retry_after: now + timedelta(seconds=delay),
-            RuntimeSlot.last_error: error[:2000],
-            RuntimeSlot.confirmation_status: "none",
-            RuntimeSlot.updated_at: now,
-        },
-        synchronize_session=False,
+    current = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
+    allocation = RuntimeAllocationIdentity(
+        session_id=task.edge_session_id,
+        binding_id=task.runtime_binding_id,
+        task_id=task.task_id,
     )
+    if current is None:
+        return
+    try:
+        transition_runtime_slot(
+            db,
+            current,
+            expected_allocation=allocation,
+            process_state="stopped",
+            slot_state="free",
+            model_state="empty",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+            process_pid=None,
+            control_url=None,
+            grpc_target=None,
+            startup_deadline=None,
+            startup_failure_count=failure_count,
+            retry_after=now + timedelta(seconds=delay),
+            last_error=error[:2000],
+            confirmation_status="none",
+            commit=False,
+        )
+    except RuntimeTransitionConflict:
+        logger.warning(
+            "忽略已重新分配 slot 的旧启动失败清理: slot_id=%s task_id=%s",
+            slot.slot_id,
+            task.task_id,
+        )
+        return
     binding = _find_binding(db, task.runtime_binding_id)
     if binding is not None and binding.cloud_slot_id == slot.slot_id:
-        binding.cloud_slot_id = None
-        binding.status = "pending"
-        binding.updated_at = now
-        db.add(binding)
+        transition_runtime_binding(
+            db,
+            binding,
+            cloud_slot_id=None,
+            status="pending",
+            commit=False,
+        )
     task.cloud_slot_id = None
     task.allocated_cloud_slot_id = None
     task.spawned_cloud_slot = None
@@ -574,6 +606,12 @@ async def _reserve_edge_slot_for_task(
     slot: RuntimeSlot,
     task: ScheduleTask,
 ) -> RuntimeSlot:
+    lease, lease_reason = resolve_current_schedule_task(db, task_id=task.task_id)
+    if lease is None:
+        raise RuntimeSlotCapacityUnavailable(
+            f"task {task.task_id} 已失去调度授权: {lease_reason}"
+        )
+    task = lease.task
     if slot.owner_binding_id == task.runtime_binding_id and slot.task_id == task.task_id:
         return slot
     reclaim_retained = slot.slot_state == "retained" and slot.model_state == "ready"
@@ -586,33 +624,22 @@ async def _reserve_edge_slot_for_task(
     if not available:
         raise RuntimeSlotCapacityUnavailable(f"edge slot {slot.slot_id} 当前被其他任务占用")
 
-    query = db.query(RuntimeSlot).filter(
-        RuntimeSlot.slot_id == slot.slot_id,
-        RuntimeSlot.slot_state == slot.slot_state,
-        RuntimeSlot.model_state == slot.model_state,
-    )
-    query = _same_value_filter(query, RuntimeSlot.owner_session_id, slot.owner_session_id)
-    query = _same_value_filter(query, RuntimeSlot.owner_binding_id, slot.owner_binding_id)
-    query = _same_value_filter(query, RuntimeSlot.task_id, slot.task_id)
-    updated = query.update(
-        {
-            RuntimeSlot.slot_state: "bound",
-            RuntimeSlot.model_state: "loading",
-            RuntimeSlot.owner_session_id: task.edge_session_id,
-            RuntimeSlot.owner_binding_id: task.runtime_binding_id,
-            RuntimeSlot.task_id: task.task_id,
-            RuntimeSlot.model_type: task.model_type,
-            RuntimeSlot.active_request_count: 0,
-            RuntimeSlot.idle_deadline: None,
-            RuntimeSlot.process_idle_deadline: None,
-            RuntimeSlot.updated_at: datetime.utcnow(),
-        },
-        synchronize_session=False,
-    )
-    if updated != 1:
-        db.rollback()
+    try:
+        transition_runtime_slot(
+            db,
+            slot,
+            slot_state="bound",
+            model_state="loading",
+            owner_session_id=task.edge_session_id,
+            owner_binding_id=task.runtime_binding_id,
+            task_id=task.task_id,
+            model_type=task.model_type,
+            active_request_count=0,
+            idle_deadline=None,
+            process_idle_deadline=None,
+        )
+    except RuntimeTransitionConflict:
         raise RuntimeSlotCapacityUnavailable(f"edge slot {slot.slot_id} 原子预留失败")
-    db.commit()
     db.expire_all()
     reserved = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot.slot_id).first()
     if reclaim_retained:
@@ -641,24 +668,29 @@ async def _reserve_edge_slot_for_task(
 
 
 def _release_edge_reservation(db: Session, task: ScheduleTask) -> None:
-    db.query(RuntimeSlot).filter(
+    slot = db.query(RuntimeSlot).filter(
         RuntimeSlot.slot_id == task.edge_slot_id,
         RuntimeSlot.owner_binding_id == task.runtime_binding_id,
         RuntimeSlot.task_id == task.task_id,
         RuntimeSlot.model_state == "loading",
-    ).update(
-        {
-            RuntimeSlot.slot_state: "free",
-            RuntimeSlot.model_state: "empty",
-            RuntimeSlot.owner_session_id: None,
-            RuntimeSlot.owner_binding_id: None,
-            RuntimeSlot.task_id: None,
-            RuntimeSlot.model_type: None,
-            RuntimeSlot.updated_at: datetime.utcnow(),
-        },
-        synchronize_session=False,
+    ).first()
+    if slot is None:
+        return
+    transition_runtime_slot(
+        db,
+        slot,
+        expected_allocation=RuntimeAllocationIdentity(
+            session_id=task.edge_session_id,
+            binding_id=task.runtime_binding_id,
+            task_id=task.task_id,
+        ),
+        slot_state="free",
+        model_state="empty",
+        owner_session_id=None,
+        owner_binding_id=None,
+        task_id=None,
+        model_type=None,
     )
-    db.commit()
 
 
 def _set_task_waiting_for_runtime_slot(db: Session, task: ScheduleTask, message: str) -> bool:
@@ -667,17 +699,11 @@ def _set_task_waiting_for_runtime_slot(db: Session, task: ScheduleTask, message:
         fail_task(db, task, "等待 runtime slot 超时", message)
         binding = _find_binding(db, task.runtime_binding_id)
         if binding is not None:
-            binding.status = "released"
-            binding.updated_at = datetime.utcnow()
-            db.add(binding)
-            db.commit()
+            transition_runtime_binding(db, binding, status="released")
         return False
     binding = _find_binding(db, task.runtime_binding_id)
     if binding is not None and not binding.cloud_slot_id:
-        binding.status = "pending"
-        binding.updated_at = datetime.utcnow()
-        db.add(binding)
-        db.commit()
+        transition_runtime_binding(db, binding, status="pending")
     update_task(
         db,
         task,
@@ -769,6 +795,12 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
     if was_retained:
         try:
             state = await fetch_runtime_state(reserved)
+            lease, lease_reason = resolve_current_schedule_task(db, task_id=task.task_id)
+            if lease is None:
+                await cleanup_task_after_lease_loss(task.task_id, lease_reason)
+                raise RuntimeSlotCapacityUnavailable(
+                    f"task {task.task_id} 已失去调度授权"
+                )
             if _runtime_state_is_busy(state):
                 raise RuntimeError(f"{reserved.slot_id} 仍有活跃推理或正在卸载")
             if _runtime_state_has_loaded_model(state):
@@ -798,7 +830,14 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
         process_info = await start_decode_server_process_locked(reserved.slot_index)
     else:
         process_info = await start_decode_server_process_for_slot_locked(reserved.slot_id, reserved.slot_index)
-    reserved = update_runtime_slot_state(
+    lease, lease_reason = resolve_current_schedule_task(db, task_id=task.task_id)
+    if lease is None:
+        stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
+        await cleanup_task_after_lease_loss(task.task_id, lease_reason)
+        raise RuntimeSlotCapacityUnavailable(
+            f"task {task.task_id} 已失去调度授权"
+        )
+    reserved = transition_runtime_slot(
         db,
         reserved,
         control_url=process_info.control_url,
@@ -812,13 +851,20 @@ async def allocate_cloud_slot_for_task(db: Session, task: ScheduleTask, cloud_ip
         slot_id=process_info.slot_id,
         process_pid=process_info.process_pid,
     )
+    lease, lease_reason = resolve_current_schedule_task(db, task_id=task.task_id)
+    if lease is None:
+        stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
+        await cleanup_task_after_lease_loss(task.task_id, lease_reason)
+        raise RuntimeSlotCapacityUnavailable(
+            f"task {task.task_id} 已失去调度授权"
+        )
     if not health_ok:
         stop_slot_process(process_info.slot_id, process_pid=process_info.process_pid)
         error = f"cloud slot {process_info.slot_id} 启动后健康检查失败"
         _mark_cloud_slot_startup_failed(db, reserved, task, error)
         raise RuntimeSlotCapacityUnavailable(error)
 
-    reserved = update_runtime_slot_state(
+    reserved = transition_runtime_slot(
         db,
         reserved,
         process_state="running",
@@ -1006,7 +1052,7 @@ async def promote_waiting_loading_task() -> bool:
                 fail_task(db, next_task, "等待 runtime slot 超时", "超过 runtime slot 最大等待时间")
                 binding = _find_binding(db, next_task.runtime_binding_id)
                 if binding is not None:
-                    update_runtime_binding(db, binding, status="released")
+                    transition_runtime_binding(db, binding, status="released")
 
             update_task(
                 db,
@@ -1031,12 +1077,62 @@ async def promote_waiting_loading_task() -> bool:
     return True
 
 
+def close_session_schedule_state(
+    db: Session,
+    edge_session: EdgeSession,
+) -> set[str]:
+    """Atomically close a session, terminate active tasks, and release bindings."""
+    now = datetime.utcnow()
+    active_tasks = (
+        db.query(ScheduleTask)
+        .filter(
+            ScheduleTask.edge_session_id == edge_session.session_id,
+            ScheduleTask.status.in_(["accepted", "running"]),
+            ScheduleTask.queue_status != "done",
+        )
+        .all()
+    )
+    previous_queue_statuses = {task.queue_status for task in active_tasks}
+
+    edge_session.status = "closed"
+    edge_session.updated_at = now
+    edge_session.last_active_at = now
+    edge_session.lease_expires_at = now
+    db.add(edge_session)
+
+    for task in active_tasks:
+        task.status = "failed"
+        task.queue_status = "done"
+        task.queue_position = 0
+        task.message = "会话已关闭，调度任务已取消"
+        task.error_detail = f"session_closed: session_id={edge_session.session_id}"
+        task.updated_at = now
+        db.add(task)
+
+    bindings = (
+        db.query(RuntimeBinding)
+        .filter(RuntimeBinding.session_id == edge_session.session_id)
+        .all()
+    )
+    for binding in bindings:
+        transition_runtime_binding(
+            db,
+            binding,
+            status="released",
+            commit=False,
+        )
+
+    db.commit()
+    db.refresh(edge_session)
+    return previous_queue_statuses
+
+
 async def cleanup_spawned_cloud_slot_after_dispatch_failure(db: Session, cloud_slot: RuntimeSlot) -> None:
     from app.services.decode_server_process_manager import stop_slot_process
 
     stop_ok = stop_slot_process(cloud_slot.slot_id, process_pid=cloud_slot.process_pid)
     if stop_ok:
-        update_runtime_slot_state(
+        transition_runtime_slot(
             db,
             cloud_slot,
             slot_state="free",
@@ -1052,7 +1148,7 @@ async def cleanup_spawned_cloud_slot_after_dispatch_failure(db: Session, cloud_s
             last_used_at=datetime.utcnow(),
         )
     else:
-        update_runtime_slot_state(
+        transition_runtime_slot(
             db,
             cloud_slot,
             slot_state="needs_reconcile",
@@ -1062,12 +1158,48 @@ async def cleanup_spawned_cloud_slot_after_dispatch_failure(db: Session, cloud_s
         )
 
 
+async def cleanup_task_after_lease_loss(task_id: str, reason: str) -> None:
+    """Clean only reservations still owned by the task that lost authority."""
+    from app.services.slot_reaper import cleanup_runtime_slots_for_task
+
+    cleanup_db = SessionLocal()
+    try:
+        task = (
+            cleanup_db.query(ScheduleTask)
+            .filter(ScheduleTask.task_id == task_id)
+            .first()
+        )
+        if task is None or not task.edge_session_id:
+            return
+        if task.status == "completed":
+            return
+        logger.warning(
+            "调度任务已失去授权，执行补偿清理: task_id=%s session_id=%s reason=%s",
+            task_id,
+            task.edge_session_id,
+            reason,
+        )
+        await cleanup_runtime_slots_for_task(
+            cleanup_db,
+            task.task_id,
+            task.runtime_binding_id,
+        )
+    finally:
+        cleanup_db.close()
+
+
 async def dispatch_loading_task(task_id: str) -> None:
     db = SessionLocal()
     try:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if not task or task.status in TASK_TERMINAL_STATUSES:
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            logger.info(
+                "跳过已失去调度授权的 loading 任务: task_id=%s reason=%s",
+                task_id,
+                lease_reason,
+            )
             return
+        task = lease.task
         if not task.strategy_payload:
             await fail_task_and_promote(db, task, "切分策略尚未生成", "策略加载前缺少 strategy_payload")
             return
@@ -1122,6 +1254,11 @@ async def dispatch_loading_task(task_id: str) -> None:
                     edge_slot=session_edge_slot,
                     cloud_slot=session_cloud_slot,
                 )
+                lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+                if lease is None:
+                    await cleanup_task_after_lease_loss(task_id, lease_reason)
+                    return
+                task = lease.task
             except RuntimeSlotBusyForReload as exc:
                 update_task(
                     db,
@@ -1150,7 +1287,11 @@ async def dispatch_loading_task(task_id: str) -> None:
                     raise RuntimeSlotCapacityUnavailable("当前会话 cloud slot 原子预留失败")
             except RuntimeSlotCapacityUnavailable as exc:
                 _release_edge_reservation(db, task)
-                task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+                lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+                if lease is None:
+                    await cleanup_task_after_lease_loss(task_id, lease_reason)
+                    return
+                task = lease.task
                 _set_task_waiting_for_runtime_slot(db, task, str(exc))
                 return
         else:
@@ -1159,7 +1300,11 @@ async def dispatch_loading_task(task_id: str) -> None:
                 cloud_slot, spawned_cloud_slot = await allocate_cloud_slot_for_task(db, task)
             except RuntimeSlotCapacityUnavailable as exc:
                 _release_edge_reservation(db, task)
-                task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
+                lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+                if lease is None:
+                    await cleanup_task_after_lease_loss(task_id, lease_reason)
+                    return
+                task = lease.task
                 _set_task_waiting_for_runtime_slot(db, task, f"runtime slot 暂不可用，已进入 FIFO 等待队列：{exc}")
                 logger.info("runtime slot 容量不足，任务进入等待队列: task_id=%s error=%s", task_id, exc)
                 return
@@ -1168,11 +1313,15 @@ async def dispatch_loading_task(task_id: str) -> None:
                 await fail_task_and_promote(db, task, "云端 decode slot 分配失败", str(exc))
                 return
 
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        binding = _find_binding(db, task.runtime_binding_id)
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            await cleanup_task_after_lease_loss(task_id, lease_reason)
+            return
+        task = lease.task
+        binding = lease.binding
 
         if binding is not None:
-            update_runtime_binding(
+            transition_runtime_binding(
                 db,
                 binding,
                 edge_slot_id=edge_slot.slot_id,
@@ -1233,21 +1382,42 @@ async def dispatch_loading_task(task_id: str) -> None:
             cloud_slot.slot_id,
         )
 
-        results = await asyncio.gather(
-            dispatch_strategy_to_runtime(
-                node_role="edge",
-                device_ip=edge_ip,
-                payload=edge_dispatch_payload,
-                control_url=edge_slot.control_url,
-            ),
-            dispatch_strategy_to_runtime(
-                node_role="cloud",
-                device_ip=cloud_ip,
-                payload=cloud_dispatch_payload,
-                control_url=cloud_slot.control_url,
-            ),
-            return_exceptions=True,
-        )
+        dispatch_lease_lost_reason: str | None = None
+        async with get_schedule_effect_lock(task.edge_session_id):
+            dispatch_lease, dispatch_lease_reason = resolve_current_schedule_task(
+                db,
+                task_id=task_id,
+            )
+            if dispatch_lease is None:
+                dispatch_lease_lost_reason = dispatch_lease_reason
+                results = []
+            else:
+                task = dispatch_lease.task
+                results = await asyncio.gather(
+                    dispatch_strategy_to_runtime(
+                        node_role="edge",
+                        device_ip=edge_ip,
+                        payload=edge_dispatch_payload,
+                        control_url=edge_slot.control_url,
+                    ),
+                    dispatch_strategy_to_runtime(
+                        node_role="cloud",
+                        device_ip=cloud_ip,
+                        payload=cloud_dispatch_payload,
+                        control_url=cloud_slot.control_url,
+                    ),
+                    return_exceptions=True,
+                )
+
+        if dispatch_lease_lost_reason is not None:
+            await cleanup_task_after_lease_loss(task_id, dispatch_lease_lost_reason)
+            return
+
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            await cleanup_task_after_lease_loss(task_id, lease_reason)
+            return
+        task = lease.task
 
         dispatch_errors: list[str] = []
         dispatch_exceptions: list[Exception] = []
@@ -1285,52 +1455,20 @@ async def dispatch_loading_task(task_id: str) -> None:
             await fail_task_and_promote(db, task, "切分策略下发失败", " | ".join(dispatch_errors))
             return
 
-        update_runtime_slot_state(
-            db,
-            edge_slot,
-            owner_session_id=task.edge_session_id,
-            owner_binding_id=task.runtime_binding_id,
-            task_id=task.task_id,
-            model_type=task.model_type,
-            slot_state="bound",
-            model_state="loading",
-            process_state="running",
-            active_request_count=0,
-            idle_deadline=None,
-            process_idle_deadline=None,
-            confirmation_status="none",
-            startup_deadline=None,
-        )
-        update_runtime_slot_state(
-            db,
-            cloud_slot,
-            owner_session_id=task.edge_session_id,
-            owner_binding_id=task.runtime_binding_id,
-            task_id=task.task_id,
-            model_type=task.model_type,
-            slot_state="bound",
-            model_state="loading",
-            process_state="running",
-            active_request_count=0,
-            idle_deadline=None,
-            process_idle_deadline=None,
-            confirmation_status="pending",
-            startup_deadline=None,
-        )
-
-        update_task(
-            db,
-            task,
-            phase="loading",
-            phase_progress=15,
-            message="模型启动请求已受理，等待边云推理节点完成模型加载",
-            edge_status="loading",
-            cloud_status="loading",
-            edge_strategy_progress=100,
-            cloud_strategy_progress=100,
-            edge_message="等待边端开始加载模型",
-            cloud_message="等待云端开始加载模型",
-        )
+        if task.edge_status == "dispatching" and task.cloud_status == "dispatching":
+            update_task(
+                db,
+                task,
+                phase="loading",
+                phase_progress=15,
+                message="模型启动请求已受理，等待边云推理节点完成模型加载",
+                edge_status="loading",
+                cloud_status="loading",
+                edge_strategy_progress=100,
+                cloud_strategy_progress=100,
+                edge_message="等待边端开始加载模型",
+                cloud_message="等待云端开始加载模型",
+            )
     finally:
         db.close()
 
@@ -1341,6 +1479,15 @@ async def fail_task_and_promote(
     message: str,
     error_detail: str | None = None,
 ) -> None:
+    lease, lease_reason = resolve_current_schedule_task(db, task_id=task.task_id)
+    if lease is None:
+        logger.info(
+            "忽略已失去调度授权任务的失败写入: task_id=%s reason=%s",
+            task.task_id,
+            lease_reason,
+        )
+        return
+    task = lease.task
     previous_queue_status = task.queue_status
     fail_task(db, task, message, error_detail)
     if previous_queue_status == STRATEGY_QUEUED_STATUS:
@@ -1378,13 +1525,15 @@ async def complete_task_and_promote(db: Session, task: ScheduleTask) -> None:
 async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_session_id: str, trigger_payload: dict) -> None:
     db = SessionLocal()
     try:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if not task:
-            logger.error("后台任务启动失败，未找到调度任务: %s", task_id)
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            logger.info(
+                "后台任务启动时已失去调度授权: task_id=%s reason=%s",
+                task_id,
+                lease_reason,
+            )
             return
-        if task.status in TASK_TERMINAL_STATUSES:
-            logger.info("调度任务已处于终态，跳过后台处理: task_id=%s status=%s", task_id, task.status)
-            return
+        task = lease.task
 
         raw_model_type = trigger_payload["model_type"]
         model_type_key = resolve_model_type_key(raw_model_type)
@@ -1471,6 +1620,15 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             get_prometheus_metrics(cloud_ip),
             get_network_metrics(edge_ip, cloud_ip),
         )
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            logger.info(
+                "指标采集完成后任务已失去调度授权: task_id=%s reason=%s",
+                task_id,
+                lease_reason,
+            )
+            return
+        task = lease.task
         edge_storage_limit_gb = derive_edge_storage_limit_gb_from_metrics(edge_metrics)
 
         logger.info(
@@ -1529,15 +1687,35 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             cloud_strategy_progress=30,
         )
 
+        fixed_strategy = uses_fixed_runtime_strategy(model_type_key)
         update_task(
             db,
             task,
             phase_progress=60,
-            message="策略输入 JSON 已生成，正在请求切分策略模型",
+            message=(
+                "BERT 固定编码协议已生成，正在准备边云加载策略"
+                if fixed_strategy
+                else "策略输入 JSON 已生成，正在请求切分策略模型"
+            ),
             edge_strategy_progress=60,
             cloud_strategy_progress=60,
         )
-        decision_result = await request_algorithm_decision(task_id, model_type, raw_input_json)
+        decision_result = await resolve_runtime_decision(
+            task_id,
+            model_type,
+            model_type_key,
+            raw_input_json,
+        )
+
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            logger.info(
+                "策略计算完成后任务已失去调度授权: task_id=%s reason=%s",
+                task_id,
+                lease_reason,
+            )
+            return
+        task = lease.task
 
         update_task(
             db,
@@ -1545,33 +1723,45 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
             strategy_payload=json.dumps(decision_result, ensure_ascii=False),
             phase="loading",
             phase_progress=0,
-            message="切分策略计算完成，准备下发模型启动请求",
+            message=(
+                "BERT 固定编码协议已确认，准备下发模型启动请求"
+                if fixed_strategy
+                else "切分策略计算完成，准备下发模型启动请求"
+            ),
             queue_status=LOADING_RUNNING_STATUS,
             queue_position=0,
             edge_strategy_progress=100,
             cloud_strategy_progress=100,
         )
         await promote_next_queued_strategy_task()
+        lease, lease_reason = resolve_current_schedule_task(db, task_id=task_id)
+        if lease is None:
+            logger.info(
+                "下发前任务已失去调度授权: task_id=%s reason=%s",
+                task_id,
+                lease_reason,
+            )
+            return
         await dispatch_loading_task(task_id)
 
     except httpx.TimeoutException:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if task:
+        lease, _ = resolve_current_schedule_task(db, task_id=task_id)
+        if lease:
             await fail_task_and_promote(
                 db,
-                task,
+                lease.task,
                 "请求算法切分策略服务超时",
                 f"请求算法切分策略服务超时 ({settings.ALGORITHM_API_TIMEOUT_SECONDS}s)",
             )
     except httpx.HTTPError as exc:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if task:
-            await fail_task_and_promote(db, task, "请求算法切分策略服务失败", str(exc))
+        lease, _ = resolve_current_schedule_task(db, task_id=task_id)
+        if lease:
+            await fail_task_and_promote(db, lease.task, "请求算法切分策略服务失败", str(exc))
     except Exception as exc:
         logger.exception("调度任务执行异常: task_id=%s", task_id)
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == task_id).first()
-        if task:
-            await fail_task_and_promote(db, task, "调度任务执行失败", str(exc))
+        lease, _ = resolve_current_schedule_task(db, task_id=task_id)
+        if lease:
+            await fail_task_and_promote(db, lease.task, "调度任务执行失败", str(exc))
     finally:
         db.close()
 
@@ -1579,12 +1769,6 @@ async def process_schedule_task(task_id: str, openwebui_user_id: str, edge_sessi
 async def handle_runtime_progress(payload, callback_role: str | None = None) -> dict:
     db = SessionLocal()
     try:
-        task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
-        if not task:
-            return {"status": "error", "message": "未找到对应的调度任务", "http_status": 404}
-        if task.status in TASK_TERMINAL_STATUSES:
-            return {"status": "success", "message": "任务已处于终态，忽略重复回调"}
-
         resolved_node_role = callback_role or payload.node_role
         if not resolved_node_role:
             return {"status": "error", "message": "缺少 node_role，且未使用带角色的回调地址", "http_status": 400}
@@ -1595,6 +1779,28 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
 
         if node_role not in {"edge", "cloud"}:
             return {"status": "error", "message": "node_role 仅支持 edge 或 cloud", "http_status": 400}
+        if node_status not in {"loading", "ready", "completed", "failed"}:
+            return {"status": "error", "message": "不支持的 runtime status", "http_status": 400}
+
+        context, stale_reason = resolve_current_runtime_allocation(
+            db,
+            task_id=payload.task_id,
+            node_role=node_role,
+        )
+        if context is None:
+            if stale_reason == "task not found":
+                return {"status": "error", "message": "未找到对应的调度任务", "http_status": 404}
+            logger.warning(
+                "忽略非当前 allocation 的 runtime 回调: task_id=%s role=%s status=%s reason=%s",
+                payload.task_id,
+                node_role,
+                node_status,
+                stale_reason,
+            )
+            return {"status": "success", "message": f"回调已过期，已幂等忽略: {stale_reason}"}
+
+        task = context.task
+        slot = context.slot
 
         if node_status == "failed":
             await fail_task_and_promote(db, task, payload.message, f"{node_role} runtime failed")
@@ -1605,44 +1811,67 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
             "phase": "loading",
             "message": payload.message,
         }
-        slot_id = task.edge_slot_id if node_role == "edge" else task.cloud_slot_id
         stage = (payload.stage or "runtime_load").strip().lower()
-        if slot_id:
-            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
-            if slot is not None:
-                slot_fields = {
-                    "active_request_count": 0,
-                    "last_used_at": datetime.utcnow(),
-                }
-                if node_status in {"loading", "dispatching"}:
-                    slot_fields["model_state"] = "loading"
-                    slot_fields["slot_state"] = "bound"
-                elif node_status in {"ready", "completed"}:
-                    slot_fields["model_state"] = "ready"
-                    slot_fields["slot_state"] = "bound"
-                    slot_fields["integrity_status"] = "healthy"
-                    slot_fields["startup_deadline"] = None
-                update_runtime_slot_state(db, slot, **slot_fields)
+        if stage not in {"runtime_load", "integrity"}:
+            return {"status": "error", "message": "stage 仅支持 runtime_load 或 integrity", "http_status": 400}
+
+        slot_fields = {
+            "active_request_count": 0,
+            "last_used_at": datetime.utcnow(),
+        }
+        if node_status == "loading" and slot.model_state != "ready":
+            slot_fields.update(model_state="loading", slot_state="bound")
+        elif node_status in {"ready", "completed"}:
+            slot_fields.update(
+                model_state="ready",
+                slot_state="bound",
+                integrity_status="healthy",
+                startup_deadline=None,
+            )
+        try:
+            transition_runtime_slot(
+                db,
+                slot,
+                expected_allocation=RuntimeAllocationIdentity(
+                    session_id=context.session.session_id,
+                    binding_id=context.binding.binding_id,
+                    task_id=task.task_id,
+                ),
+                commit=False,
+                **slot_fields,
+            )
+        except RuntimeTransitionConflict:
+            logger.warning(
+                "runtime 回调提交前 allocation 已变化，幂等忽略: task_id=%s role=%s",
+                payload.task_id,
+                node_role,
+            )
+            return {"status": "success", "message": "回调已过期，已幂等忽略"}
+
         if node_role == "edge":
-            update_kwargs["edge_status"] = node_status
+            if task.edge_status not in {"ready", "completed"} or node_status in {"ready", "completed"}:
+                update_kwargs["edge_status"] = node_status
             update_kwargs["edge_message"] = payload.message
             if stage == "integrity":
-                update_kwargs["edge_integrity_progress"] = progress
+                update_kwargs["edge_integrity_progress"] = max(task.edge_integrity_progress or 0, progress)
             else:
-                update_kwargs["edge_runtime_load_progress"] = progress
+                update_kwargs["edge_runtime_load_progress"] = max(task.edge_runtime_load_progress or 0, progress)
                 if node_status in {"ready", "completed"} and task.edge_integrity_progress == 0:
                     update_kwargs["edge_integrity_progress"] = 100
         else:
-            update_kwargs["cloud_status"] = node_status
+            if task.cloud_status not in {"ready", "completed"} or node_status in {"ready", "completed"}:
+                update_kwargs["cloud_status"] = node_status
             update_kwargs["cloud_message"] = payload.message
             if stage == "integrity":
-                update_kwargs["cloud_integrity_progress"] = progress
+                update_kwargs["cloud_integrity_progress"] = max(task.cloud_integrity_progress or 0, progress)
             else:
-                update_kwargs["cloud_runtime_load_progress"] = progress
+                update_kwargs["cloud_runtime_load_progress"] = max(task.cloud_runtime_load_progress or 0, progress)
                 if node_status in {"ready", "completed"} and task.cloud_integrity_progress == 0:
                     update_kwargs["cloud_integrity_progress"] = 100
 
-        task = update_task(db, task, **update_kwargs)
+        task = update_task(db, task, commit=False, **update_kwargs)
+        db.commit()
+        db.refresh(task)
 
         if (
             task.edge_progress >= 100

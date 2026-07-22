@@ -8,7 +8,10 @@ from app.core.config import settings
 from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot
 from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
-from app.services.runtime_slot_service import update_runtime_slot_state
+from app.services.runtime_state_transition_service import (
+    transition_runtime_binding,
+    transition_runtime_slot,
+)
 
 
 logger = logging.getLogger("SlotReaper")
@@ -43,9 +46,12 @@ def mark_expired_sessions(db: Session) -> int:
 def release_bindings_for_session(db: Session, session_id: str) -> int:
     bindings = db.query(RuntimeBinding).filter(RuntimeBinding.session_id == session_id).all()
     for binding in bindings:
-        binding.status = "released"
-        binding.updated_at = datetime.utcnow()
-        db.add(binding)
+        transition_runtime_binding(
+            db,
+            binding,
+            status="released",
+            commit=False,
+        )
     if bindings:
         db.commit()
     return len(bindings)
@@ -69,7 +75,7 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
         try:
             state = await fetch_runtime_state(slot)
         except Exception:
-            update_runtime_slot_state(
+            transition_runtime_slot(
                 db,
                 slot,
                 process_state="failed",
@@ -83,7 +89,7 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
         ready = bool(state.get("ready"))
         draining = bool(state.get("draining"))
 
-        update_runtime_slot_state(
+        transition_runtime_slot(
             db,
             slot,
             active_request_count=active_request_count,
@@ -95,12 +101,15 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
 
         deadline = release_grace_deadline()
         if ready and deadline is not None:
-            update_runtime_slot_state(
+            transition_runtime_slot(
                 db,
                 slot,
                 slot_state="retained",
                 model_state="ready",
                 active_request_count=0,
+                owner_session_id=None,
+                owner_binding_id=None,
+                task_id=None,
                 idle_deadline=slot.idle_deadline or deadline,
                 process_idle_deadline=None,
                 last_used_at=datetime.utcnow(),
@@ -115,7 +124,7 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
                 )
                 released.append(slot.slot_id)
             except Exception:
-                update_runtime_slot_state(
+                transition_runtime_slot(
                     db,
                     slot,
                     slot_state="needs_reconcile",
@@ -124,7 +133,123 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
                 )
                 continue
         else:
-            update_runtime_slot_state(
+            transition_runtime_slot(
+                db,
+                slot,
+                slot_state="free",
+                model_state="empty",
+                owner_session_id=None,
+                owner_binding_id=None,
+                model_type=None,
+                task_id=None,
+                active_request_count=0,
+                last_used_at=datetime.utcnow(),
+            )
+            released.append(slot.slot_id)
+    return released
+
+
+async def cleanup_runtime_slots_for_task(
+    db: Session,
+    task_id: str,
+    binding_id: str | None,
+) -> list[str]:
+    """Release only slots that are still owned by one superseded task.
+
+    The ownership is re-read after the runtime-state network call.  This prevents
+    an old coroutine from cleaning a slot that was reassigned while it awaited
+    the runtime response.
+    """
+    query = db.query(RuntimeSlot).filter(RuntimeSlot.task_id == task_id)
+    if binding_id:
+        query = query.filter(RuntimeSlot.owner_binding_id == binding_id)
+    slot_ids = [slot.slot_id for slot in query.all()]
+    released: list[str] = []
+
+    for slot_id in slot_ids:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+        if slot is None:
+            continue
+        try:
+            state = await fetch_runtime_state(slot)
+        except Exception:
+            db.expire_all()
+            current = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if (
+                current is not None
+                and current.task_id == task_id
+                and (not binding_id or current.owner_binding_id == binding_id)
+            ):
+                transition_runtime_slot(
+                    db,
+                    current,
+                    process_state="failed",
+                    slot_state="needs_reconcile",
+                    model_state="failed",
+                    last_used_at=datetime.utcnow(),
+                )
+            continue
+
+        db.expire_all()
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+        if (
+            slot is None
+            or slot.task_id != task_id
+            or (binding_id and slot.owner_binding_id != binding_id)
+        ):
+            logger.info(
+                "跳过已重新分配的 task slot 清理: slot_id=%s old_task_id=%s",
+                slot_id,
+                task_id,
+            )
+            continue
+
+        active_request_count = int(state.get("active_request_count") or 0)
+        ready = bool(state.get("ready"))
+        draining = bool(state.get("draining"))
+        transition_runtime_slot(
+            db,
+            slot,
+            active_request_count=active_request_count,
+            last_used_at=datetime.utcnow(),
+        )
+        if active_request_count != 0 or draining:
+            continue
+
+        deadline = release_grace_deadline()
+        if ready and deadline is not None:
+            transition_runtime_slot(
+                db,
+                slot,
+                slot_state="retained",
+                model_state="ready",
+                active_request_count=0,
+                owner_session_id=None,
+                owner_binding_id=None,
+                task_id=None,
+                idle_deadline=slot.idle_deadline or deadline,
+                process_idle_deadline=None,
+                last_used_at=datetime.utcnow(),
+            )
+            released.append(slot.slot_id)
+        elif ready or state.get("task_id") or state.get("model_type"):
+            try:
+                await unload_runtime_slot(
+                    db,
+                    slot,
+                    reason=f"task {task_id} lost schedule authority",
+                )
+                released.append(slot.slot_id)
+            except Exception:
+                transition_runtime_slot(
+                    db,
+                    slot,
+                    slot_state="needs_reconcile",
+                    model_state="failed",
+                    last_used_at=datetime.utcnow(),
+                )
+        else:
+            transition_runtime_slot(
                 db,
                 slot,
                 slot_state="free",

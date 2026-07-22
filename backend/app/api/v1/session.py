@@ -15,8 +15,14 @@ from app.api.deps import (
 from app.models.models import Device, EdgeSession
 from app.core.security import extract_claim
 from app.core.config import settings
-from app.services.schedule_orchestrator import promote_waiting_loading_task
-from app.services.slot_reaper import cleanup_runtime_slots_for_session, release_bindings_for_session
+from app.services.schedule_orchestrator import (
+    close_session_schedule_state,
+    get_schedule_effect_lock,
+    promote_next_queued_strategy_task,
+    promote_waiting_loading_task,
+)
+from app.services.schedule_queue import STRATEGY_QUEUED_STATUS, STRATEGY_RUNNING_STATUS
+from app.services.slot_reaper import cleanup_runtime_slots_for_session
 from app.schemas.schemas import (
     SessionCloseRequest,
     SessionCloseResponse,
@@ -173,16 +179,22 @@ async def close_openwebui_session(
     if not edge_session:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    now = datetime.utcnow()
-    edge_session.status = "closed"
-    edge_session.updated_at = now
-    edge_session.last_active_at = now
-    edge_session.lease_expires_at = now
-    db.add(edge_session)
-    db.commit()
-    db.refresh(edge_session)
-    release_bindings_for_session(db, edge_session.session_id)
+    async with get_schedule_effect_lock(edge_session.session_id):
+        db.rollback()
+        edge_session = (
+            db.query(EdgeSession)
+            .filter(
+                EdgeSession.session_id == payload.session_id,
+                EdgeSession.openwebui_user_id == openwebui_user_id,
+            )
+            .first()
+        )
+        if not edge_session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        previous_queue_statuses = close_session_schedule_state(db, edge_session)
     await cleanup_runtime_slots_for_session(db, edge_session.session_id)
+    if previous_queue_statuses.intersection({STRATEGY_RUNNING_STATUS, STRATEGY_QUEUED_STATUS}):
+        await promote_next_queued_strategy_task()
     await promote_waiting_loading_task()
     return SessionCloseResponse(
         session_id=edge_session.session_id,

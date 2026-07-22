@@ -38,6 +38,7 @@ def update_task(
     cloud_slot_id: str | None = None,
     allocated_cloud_slot_id: str | None = None,
     spawned_cloud_slot: str | None = None,
+    commit: bool = True,
 ) -> ScheduleTask:
     if status is not None:
         task.status = status
@@ -133,8 +134,11 @@ def update_task(
 
     task.updated_at = datetime.utcnow()
     db.add(task)
-    db.commit()
-    db.refresh(task)
+    if commit:
+        db.commit()
+        db.refresh(task)
+    else:
+        db.flush()
     return task
 
 

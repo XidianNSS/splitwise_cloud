@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import RuntimeSlot
 from app.schemas.schemas import CloudRuntimeConfirmationRequest
-from app.services.runtime_slot_service import update_runtime_slot_state
+from app.services.runtime_state_transition_service import transition_runtime_slot
 
 logger = logging.getLogger("RuntimeControlService")
 
@@ -47,7 +47,7 @@ async def unload_runtime_slot(
         f"{base_url}/unload_model",
         reason,
     )
-    update_runtime_slot_state(
+    transition_runtime_slot(
         db,
         slot,
         slot_state="unloading",
@@ -67,7 +67,7 @@ async def unload_runtime_slot(
     if bool(getattr(slot, "spawned_by_scheduler", 0)):
         process_idle_deadline = datetime.utcnow() + timedelta(seconds=settings.CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS)
     if preserve_reservation:
-        update_runtime_slot_state(
+        transition_runtime_slot(
             db,
             slot,
             slot_state="bound",
@@ -79,7 +79,7 @@ async def unload_runtime_slot(
             last_used_at=datetime.utcnow(),
         )
     else:
-        update_runtime_slot_state(
+        transition_runtime_slot(
             db,
             slot,
             slot_state="free",

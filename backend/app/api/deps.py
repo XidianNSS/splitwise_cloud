@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import datetime
 
 from fastapi import Depends, Header, HTTPException, Request
@@ -148,14 +149,16 @@ async def get_current_admin(
     return user
 
 
-async def verify_runtime_integrity_token(authorization: str = Header(..., alias="Authorization")) -> None:
+async def verify_runtime_integrity_token(
+    authorization: str | None = Header(None, alias="Authorization"),
+) -> None:
     expected = os.getenv("RUNTIME_INTEGRITY_TOKEN", "").strip()
     if not expected:
         raise HTTPException(status_code=503, detail="RUNTIME_INTEGRITY_TOKEN 未配置")
     prefix = "Bearer "
-    if not authorization.startswith(prefix):
+    if not authorization or not authorization.startswith(prefix):
         raise HTTPException(status_code=401, detail="缺少 Bearer token")
     token = authorization[len(prefix):].strip()
-    if token != expected:
+    if not token or not secrets.compare_digest(token, expected):
         raise HTTPException(status_code=401, detail="runtime integrity token 无效")
     return None

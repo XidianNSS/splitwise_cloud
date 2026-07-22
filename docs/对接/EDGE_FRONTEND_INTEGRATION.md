@@ -17,6 +17,12 @@ http://10.144.144.4:8010
 4. 轮询任务接口，或使用 SSE 订阅任务状态。
 5. 会话持续使用时定期 heartbeat；退出时调用 close。
 
+模型选择前可调用 `GET /api/v1/schedule/models`。生成模型在任务完成后调用
+边端 `/v1/chat/completions`；`BERT-Base-Uncased` 调用边端 `/v1/embeddings`，
+输入文本后返回 768 维向量，不会返回对话文本。
+
+`/schedule/models` 是 scheduler catalog，边端 `/v1/models` 是该节点的 runtime/OpenAI 注册表。正式前端只应展示两者交集。
+
 除 SSE 外，本文标注需要登录的接口都使用：
 
 ```http
@@ -70,6 +76,17 @@ Content-Type: application/json
 
 ## 3. 发起调度
 
+先查询 backend 实际支持的模型，避免在前端硬编码：
+
+```http
+GET /api/v1/schedule/models
+Authorization: Bearer <openwebui_access_token>
+```
+
+每项返回 `model_type`、`runtime_model_type`、`architecture`、`capability`、
+`deployment_mode` 和 `strategy_kind`。`capability=generation` 使用 chat completion；
+`capability=embeddings` 使用 embeddings。
+
 ```http
 POST /api/v1/schedule/trigger
 Authorization: Bearer <openwebui_access_token>
@@ -83,12 +100,15 @@ Content-Type: application/json
 }
 ```
 
-当前代码支持以下名称，匹配时不区分大小写：
+当前 scheduler catalog 接受以下名称，匹配时不区分大小写：
 
-- `gpt2`
-- `tinyllama`
 - `Llama-3.2-3b`
 - `Llama-3.2-3B-Instruct`
+- `BERT-Base-Uncased`
+
+其中两种 Llama 提供生成接口，BERT 提供 embeddings 接口。ModelSplit 已有代码级
+adapter/config 接入但 scheduler 尚未登记的 DeepSeek/Meta-Llama 模型不能直接从
+正式前端选择；这也不代表相关模型已经完成真实权重端到端验收。
 
 成功返回 HTTP `202`：
 
@@ -146,6 +166,18 @@ side_progress = strategy * 40% + integrity * 30% + runtime_load * 30%
 
 前端终止轮询的唯一条件应是 `status` 为 `completed` 或 `failed`。
 
+当 BERT 任务为 `completed` 后，调用所选边端的 ModelSplit OpenAI API：
+
+```http
+POST http://<edge-ip>:9003/v1/embeddings
+Content-Type: application/json
+
+{"model":"BERT-Base-Uncased","input":"text to encode"}
+```
+
+`input` 可以是一个字符串或最多 16 个字符串；数组响应按输入顺序返回。`data[*].embedding` 固定为 768 个 float，`usage` 是整批输入 token 数。该数据面请求不经过 cloud backend；
+backend 只负责提前完成模型、slot 和边云路由准备。
+
 ## 5. SSE 订阅
 
 ```http
@@ -186,10 +218,15 @@ Authorization: Bearer <openwebui_access_token>
       }
     ],
     "edge_head_count_total": 2,
-    "cloud_head_count_total": 2
+    "cloud_head_count_total": 2,
+    "strategy_kind": null,
+    "capability": null,
+    "deployment_mode": null
   }
 }
 ```
+
+生成模型的后三个 metadata 字段可能为 `null`；BERT 返回 `fixed_bert_encoder`、`embeddings` 和 `encrypted`。当前 runtime 的 `ffn_assignment` 只支持 `0=edge` 或 `1=cloud`。
 
 ## 7. 会话续期和关闭
 

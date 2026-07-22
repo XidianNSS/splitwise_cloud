@@ -17,35 +17,12 @@ load_dotenv(ENV_FILE)
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://127.0.0.1:8010")
 RUNTIME_CALLBACK_URL = f"{BACKEND_BASE_URL}/api/v1/schedule/runtime_callback/cloud"
+RUNTIME_INTEGRITY_TOKEN = os.getenv("RUNTIME_INTEGRITY_TOKEN", "").strip()
 CLOUD_RUNTIME_USE_MOCK = os.getenv("CLOUD_RUNTIME_USE_MOCK", "").strip().lower() in {"1", "true", "yes", "on"}
 RUNTIME_PORT = int(os.getenv("CLOUD_RUNTIME_MOCK_PORT", os.getenv("CLOUD_RUNTIME_PORT", "7002")))
 STEP_DELAY_SECONDS = float(os.getenv("CLOUD_RUNTIME_STEP_DELAY_SECONDS", "2.5"))
 
 MODEL_PROFILES = {
-    "gpt2": {
-        "display_name": "GPT-2",
-        "checkpoints": [
-            (8, "云端已接收 GPT-2 策略，开始准备加载"),
-            (22, "云端正在校验 GPT-2 切分配置"),
-            (38, "云端正在初始化 GPT-2"),
-            (58, "云端正在加载 GPT-2 权重"),
-            (82, "云端正在预热 GPT-2 运行环境"),
-            (94, "云端 GPT-2 即将就绪"),
-            (100, "云端 GPT-2 加载完成"),
-        ],
-    },
-    "tinyllama": {
-        "display_name": "TinyLlama",
-        "checkpoints": [
-            (10, "云端已接收 TinyLlama 策略，开始准备加载"),
-            (26, "云端正在校验 TinyLlama 切分配置"),
-            (42, "云端正在初始化 TinyLlama"),
-            (64, "云端正在加载 TinyLlama 权重"),
-            (86, "云端正在预热 TinyLlama 运行环境"),
-            (95, "云端 TinyLlama 即将就绪"),
-            (100, "云端 TinyLlama 加载完成"),
-        ],
-    },
     "llama-3.2-3b": {
         "display_name": "Llama-3.2-3b",
         "checkpoints": [
@@ -99,6 +76,7 @@ async def simulate_loading(task_id: str, model_type: str):
             await asyncio.sleep(STEP_DELAY_SECONDS)
             await client.post(
                 RUNTIME_CALLBACK_URL,
+                headers={"Authorization": f"Bearer {RUNTIME_INTEGRITY_TOKEN}"},
                 json={
                     "task_id": task_id,
                     "status": "ready" if progress == 100 else "loading",
