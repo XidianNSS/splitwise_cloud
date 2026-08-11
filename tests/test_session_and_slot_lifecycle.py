@@ -567,6 +567,88 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_session_cleanup_tolerates_concurrent_reconcile_release(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = create_runtime_binding(
+                db,
+                session_id="session-1",
+                task_id="task-1",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+            )
+            slot = ensure_runtime_slot(
+                db,
+                slot_id="edge-slot-edge_A",
+                role="edge",
+                control_url="http://127.0.0.1:9001/load_strategy",
+            )
+            transition_runtime_slot(
+                db,
+                slot,
+                slot_state="bound",
+                model_state="ready",
+                owner_session_id="session-1",
+                owner_binding_id=binding.binding_id,
+                task_id="task-1",
+                model_type="Llama-3.2-3B-Instruct",
+            )
+
+            async def release_during_runtime_probe(_slot):
+                concurrent_db = SessionLocal()
+                try:
+                    current = (
+                        concurrent_db.query(RuntimeSlot)
+                        .filter(RuntimeSlot.slot_id == "edge-slot-edge_A")
+                        .one()
+                    )
+                    transition_runtime_slot(
+                        concurrent_db,
+                        current,
+                        slot_state="retained",
+                        model_state="ready",
+                        owner_session_id=None,
+                        owner_binding_id=None,
+                        task_id=None,
+                    )
+                finally:
+                    concurrent_db.close()
+                return {
+                    "ready": True,
+                    "draining": False,
+                    "active_request_count": 0,
+                    "model_type": "Llama-3.2-3B-Instruct",
+                    "task_id": "task-1",
+                }
+
+            with patch(
+                "app.services.slot_reaper.fetch_runtime_state",
+                new=AsyncMock(side_effect=release_during_runtime_probe),
+            ):
+                import asyncio
+
+                released = asyncio.run(
+                    cleanup_runtime_slots_for_session(db, "session-1")
+                )
+            self.assertEqual(released, [])
+        finally:
+            db.close()
+
+        db = SessionLocal()
+        try:
+            slot = (
+                db.query(RuntimeSlot)
+                .filter(RuntimeSlot.slot_id == "edge-slot-edge_A")
+                .one()
+            )
+            self.assertEqual(slot.slot_state, "retained")
+            self.assertEqual(slot.model_state, "ready")
+            self.assertIsNone(slot.owner_session_id)
+            self.assertIsNone(slot.owner_binding_id)
+        finally:
+            db.close()
+
     def test_reconcile_released_ready_slot_respects_release_grace(self) -> None:
         self._create_session()
         db = SessionLocal()

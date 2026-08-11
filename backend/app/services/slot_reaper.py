@@ -9,6 +9,7 @@ from app.models.models import EdgeSession, RuntimeBinding, RuntimeSlot
 from app.services.managed_cloud_slot_cleanup_service import stop_and_clear_managed_cloud_slot
 from app.services.runtime_control_service import fetch_runtime_state, unload_runtime_slot
 from app.services.runtime_state_transition_service import (
+    RuntimeTransitionConflict,
     transition_runtime_binding,
     transition_runtime_slot,
 )
@@ -57,31 +58,96 @@ def release_bindings_for_session(db: Session, session_id: str) -> int:
     return len(bindings)
 
 
+def _slot_is_owned_by_session_bindings(
+    slot: RuntimeSlot | None,
+    *,
+    session_id: str,
+    binding_ids: set[str],
+) -> bool:
+    return bool(
+        slot is not None
+        and slot.owner_session_id == session_id
+        and slot.owner_binding_id in binding_ids
+    )
+
+
 async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> list[str]:
-    binding_ids = [
+    binding_ids = {
         binding.binding_id
         for binding in db.query(RuntimeBinding).filter(RuntimeBinding.session_id == session_id).all()
-    ]
+    }
     if not binding_ids:
         return []
 
-    slots = (
-        db.query(RuntimeSlot)
+    slot_ids = [
+        slot_id
+        for (slot_id,) in db.query(RuntimeSlot.slot_id)
         .filter(RuntimeSlot.owner_binding_id.in_(binding_ids))
         .all()
-    )
+    ]
     released: list[str] = []
-    for slot in slots:
+    for slot_id in slot_ids:
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+        if not _slot_is_owned_by_session_bindings(
+            slot,
+            session_id=session_id,
+            binding_ids=binding_ids,
+        ):
+            continue
         try:
             state = await fetch_runtime_state(slot)
-        except Exception:
-            transition_runtime_slot(
-                db,
+        except Exception as exc:
+            db.rollback()
+            db.expire_all()
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if not _slot_is_owned_by_session_bindings(
                 slot,
-                process_state="failed",
-                slot_state="needs_reconcile",
-                model_state="failed",
-                last_used_at=datetime.utcnow(),
+                session_id=session_id,
+                binding_ids=binding_ids,
+            ):
+                logger.info(
+                    "跳过已由其他协程释放或重新分配的 session slot: "
+                    "slot_id=%s session_id=%s",
+                    slot_id,
+                    session_id,
+                )
+                continue
+            try:
+                transition_runtime_slot(
+                    db,
+                    slot,
+                    process_state="failed",
+                    slot_state="needs_reconcile",
+                    model_state="failed",
+                    last_used_at=datetime.utcnow(),
+                )
+            except RuntimeTransitionConflict:
+                db.rollback()
+                logger.info(
+                    "session slot 状态探测失败后所有权已变化，交由 reconcile: "
+                    "slot_id=%s session_id=%s error=%s",
+                    slot_id,
+                    session_id,
+                    exc,
+                )
+            continue
+
+        # The network request above yields to the background reconciler.  Re-read
+        # ownership before applying the sampled state so a benign concurrent
+        # retain/release, or a newer allocation, cannot turn session close into
+        # a 500 response or overwrite that allocation.
+        db.expire_all()
+        slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+        if not _slot_is_owned_by_session_bindings(
+            slot,
+            session_id=session_id,
+            binding_ids=binding_ids,
+        ):
+            logger.info(
+                "跳过已由其他协程释放或重新分配的 session slot: "
+                "slot_id=%s session_id=%s",
+                slot_id,
+                session_id,
             )
             continue
 
@@ -89,63 +155,88 @@ async def cleanup_runtime_slots_for_session(db: Session, session_id: str) -> lis
         ready = bool(state.get("ready"))
         draining = bool(state.get("draining"))
 
-        transition_runtime_slot(
-            db,
-            slot,
-            active_request_count=active_request_count,
-            last_used_at=datetime.utcnow(),
-        )
-
-        if active_request_count != 0 or draining:
-            continue
-
-        deadline = release_grace_deadline()
-        if ready and deadline is not None:
+        try:
             transition_runtime_slot(
                 db,
                 slot,
-                slot_state="retained",
-                model_state="ready",
-                active_request_count=0,
-                owner_session_id=None,
-                owner_binding_id=None,
-                task_id=None,
-                idle_deadline=slot.idle_deadline or deadline,
-                process_idle_deadline=None,
+                active_request_count=active_request_count,
                 last_used_at=datetime.utcnow(),
             )
-            released.append(slot.slot_id)
-        elif ready or state.get("task_id") or state.get("model_type"):
-            try:
+
+            if active_request_count != 0 or draining:
+                continue
+
+            deadline = release_grace_deadline()
+            if ready and deadline is not None:
+                transition_runtime_slot(
+                    db,
+                    slot,
+                    slot_state="retained",
+                    model_state="ready",
+                    active_request_count=0,
+                    owner_session_id=None,
+                    owner_binding_id=None,
+                    task_id=None,
+                    idle_deadline=slot.idle_deadline or deadline,
+                    process_idle_deadline=None,
+                    last_used_at=datetime.utcnow(),
+                )
+                released.append(slot.slot_id)
+            elif ready or state.get("task_id") or state.get("model_type"):
                 await unload_runtime_slot(
                     db,
                     slot,
                     reason=f"session {session_id} released by slot_reaper",
                 )
                 released.append(slot.slot_id)
-            except Exception:
+            else:
                 transition_runtime_slot(
                     db,
                     slot,
-                    slot_state="needs_reconcile",
-                    model_state="failed",
+                    slot_state="free",
+                    model_state="empty",
+                    owner_session_id=None,
+                    owner_binding_id=None,
+                    model_type=None,
+                    task_id=None,
+                    active_request_count=0,
                     last_used_at=datetime.utcnow(),
                 )
-                continue
-        else:
-            transition_runtime_slot(
-                db,
-                slot,
-                slot_state="free",
-                model_state="empty",
-                owner_session_id=None,
-                owner_binding_id=None,
-                model_type=None,
-                task_id=None,
-                active_request_count=0,
-                last_used_at=datetime.utcnow(),
+                released.append(slot.slot_id)
+        except RuntimeTransitionConflict:
+            db.rollback()
+            logger.info(
+                "session slot 清理期间所有权或状态已变化，交由 reconcile: "
+                "slot_id=%s session_id=%s",
+                slot_id,
+                session_id,
             )
-            released.append(slot.slot_id)
+        except Exception as exc:
+            db.rollback()
+            db.expire_all()
+            slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == slot_id).first()
+            if _slot_is_owned_by_session_bindings(
+                slot,
+                session_id=session_id,
+                binding_ids=binding_ids,
+            ):
+                try:
+                    transition_runtime_slot(
+                        db,
+                        slot,
+                        slot_state="needs_reconcile",
+                        model_state="failed",
+                        last_used_at=datetime.utcnow(),
+                    )
+                except RuntimeTransitionConflict:
+                    db.rollback()
+            logger.warning(
+                "session slot 清理失败，已交由 reconcile: "
+                "slot_id=%s session_id=%s error=%s",
+                slot_id,
+                session_id,
+                exc,
+            )
     return released
 
 
