@@ -46,7 +46,7 @@ class EdgeTriggerRequest(BaseModel):
 class LayerPartition(BaseModel):
     layer_id: int
     head_assignments: List[int]  # 0为边端，1为云端
-    ffn_assignment: int          # 0为边端，1为云端，2为拆分
+    ffn_assignment: int          # 当前 ModelSplit 只支持 0为边端、1为云端
 
 
 class StrategyDisplayLayerPartition(BaseModel):
@@ -56,14 +56,22 @@ class StrategyDisplayLayerPartition(BaseModel):
     edge_head_count: int
     cloud_head_count: int
 
-class RuntimeDecisionPayload(BaseModel):
-    layer_partitions: List[LayerPartition]
-
-
 class StrategyDisplayDecisionPayload(BaseModel):
     layer_partitions: List[StrategyDisplayLayerPartition]
     edge_head_count_total: int
     cloud_head_count_total: int
+    strategy_kind: Optional[str] = None
+    capability: Optional[str] = None
+    deployment_mode: Optional[str] = None
+
+
+class ModelCatalogEntry(BaseModel):
+    model_type: str
+    runtime_model_type: str
+    architecture: str
+    capability: str
+    deployment_mode: str
+    strategy_kind: str
 
 
 class RuntimeProgressCallbackRequest(BaseModel):
@@ -142,6 +150,10 @@ class RuntimeSlotStatusResponse(BaseModel):
     last_used_at: Optional[str] = None
     idle_deadline: Optional[str] = None
     process_idle_deadline: Optional[str] = None
+    startup_deadline: Optional[str] = None
+    startup_failure_count: int = 0
+    retry_after: Optional[str] = None
+    last_error: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

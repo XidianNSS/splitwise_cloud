@@ -20,21 +20,6 @@ DEFAULT_MOCK_API_URL = os.getenv("ALGORITHM_MOCK_API_URL", "http://127.0.0.1:500
 DEFAULT_MOCK_PORT = urlparse(DEFAULT_MOCK_API_URL).port or 5000
 ALGORITHM_PORT = int(os.getenv("ALGORITHM_MOCK_PORT", str(DEFAULT_MOCK_PORT)))
 
-GPT2_SAMPLE_LAYER_PARTITIONS = [
-    {"layer_id": 0, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 1, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 2, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 3, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 1, "cloud_heads": 11},
-    {"layer_id": 4, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 5, "head_assignments": [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 1, "cloud_heads": 11},
-    {"layer_id": 6, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 7, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-    {"layer_id": 8, "head_assignments": [1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 2, "cloud_heads": 10},
-    {"layer_id": 9, "head_assignments": [1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1], "ffn_assignment": 2, "edge_heads": 1, "cloud_heads": 11},
-    {"layer_id": 10, "head_assignments": [1, 1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 2, "cloud_heads": 10},
-    {"layer_id": 11, "head_assignments": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "ffn_assignment": 1, "edge_heads": 0, "cloud_heads": 12},
-]
-
 LLAMA32_3B_SAMPLE_RESPONSE = {
     "status": "ok",
     "model_type": "Llama-3.2-3b",
@@ -104,12 +89,9 @@ def build_strategy_response(req: InferRequest) -> dict:
     num_layers = int(edge_spec.get("num_hidden_layers", 12) or 12)
     num_heads = int(edge_spec.get("num_attention_heads", 12) or 12)
 
-    if req.model_type.lower() == "gpt2" and num_layers == 12 and num_heads == 12:
-        layer_partitions = GPT2_SAMPLE_LAYER_PARTITIONS
-    elif req.model_type.lower() in {"llama-3.2-3b", "llama-3.2-3b-instruct"}:
+    if req.model_type.lower() in {"llama-3.2-3b", "llama-3.2-3b-instruct"}:
         return LLAMA32_3B_SAMPLE_RESPONSE
-    else:
-        layer_partitions = build_generic_layer_partitions(num_layers, num_heads)
+    layer_partitions = build_generic_layer_partitions(num_layers, num_heads)
 
     return {
         "status": "ok",

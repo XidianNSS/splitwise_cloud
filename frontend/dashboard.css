@@ -134,3 +134,398 @@ header { justify-content: flex-end; }
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
 }
+
+/* ==========================================
+   6. 云端运行态总览页面
+   ========================================== */
+.runtime-shell {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    min-height: 100%;
+}
+
+.runtime-hero {
+    display: flex;
+    justify-content: space-between;
+    gap: 20px;
+    align-items: center;
+    padding: 24px;
+    border: 1px solid rgba(56, 189, 248, 0.25);
+    border-radius: 18px;
+    background:
+        radial-gradient(circle at top left, rgba(56, 189, 248, 0.2), transparent 34%),
+        radial-gradient(circle at bottom right, rgba(167, 139, 250, 0.18), transparent 30%),
+        linear-gradient(135deg, #101826 0%, #11131d 54%, #0d1117 100%);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+
+.runtime-kicker,
+.runtime-section-label {
+    color: var(--edge-color);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+}
+
+.runtime-hero h2,
+.runtime-panel h3,
+.runtime-slot-card h4,
+.runtime-task-card h4 {
+    margin: 0;
+    color: var(--text-bright);
+}
+
+.runtime-hero h2 {
+    margin-top: 6px;
+    font-size: 2rem;
+    letter-spacing: -0.04em;
+}
+
+.runtime-hero p {
+    margin: 8px 0 0 0;
+    color: #9aa7b7;
+}
+
+.runtime-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: #8b949e;
+    white-space: nowrap;
+}
+
+.runtime-refresh-btn {
+    border: 1px solid rgba(52, 211, 153, 0.5);
+    color: #d7ffe9;
+    background: linear-gradient(135deg, rgba(35, 134, 54, 0.9), rgba(16, 185, 129, 0.35));
+    border-radius: 999px;
+    padding: 9px 16px;
+    cursor: pointer;
+    font-weight: 700;
+}
+
+.runtime-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(120px, 1fr));
+    gap: 12px;
+}
+
+.runtime-summary-card,
+.runtime-panel,
+.runtime-empty-card {
+    border: 1px solid var(--border-color);
+    background: rgba(22, 27, 34, 0.86);
+    border-radius: 14px;
+}
+
+.runtime-summary-card {
+    position: relative;
+    overflow: hidden;
+    padding: 16px;
+}
+
+.runtime-summary-card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(140deg, rgba(56, 189, 248, 0.14), transparent 48%);
+    pointer-events: none;
+}
+
+.runtime-summary-card span,
+.runtime-summary-card small,
+.runtime-muted {
+    color: #8b949e;
+}
+
+.runtime-summary-card strong {
+    display: block;
+    margin: 8px 0 6px;
+    color: var(--text-bright);
+    font-size: 1.8rem;
+}
+
+.runtime-alerts {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.runtime-alert {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    background: rgba(13, 17, 23, 0.8);
+}
+
+.runtime-alert strong {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.72rem;
+}
+
+.runtime-alert code {
+    margin-left: auto;
+    color: #8b949e;
+}
+
+.runtime-alert-ok {
+    color: var(--accent-green);
+    border-color: rgba(52, 211, 153, 0.35);
+}
+
+.runtime-alert-info {
+    color: var(--edge-color);
+    border-color: rgba(56, 189, 248, 0.35);
+}
+
+.runtime-alert-warning {
+    color: var(--accent-yellow);
+    border-color: rgba(251, 191, 36, 0.38);
+}
+
+.runtime-alert-critical {
+    color: #ff7b72;
+    border-color: rgba(255, 123, 114, 0.42);
+}
+
+.runtime-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.85fr);
+    gap: 18px;
+}
+
+.runtime-panel {
+    padding: 18px;
+    box-shadow: 0 12px 35px rgba(0, 0, 0, 0.2);
+}
+
+.runtime-panel-header,
+.runtime-slot-topline,
+.runtime-task-head,
+.runtime-task-foot,
+.runtime-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+
+.runtime-panel-header {
+    margin-bottom: 16px;
+}
+
+.runtime-slot-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 14px;
+}
+
+.runtime-slot-card,
+.runtime-task-card {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent),
+        #0d1117;
+    padding: 16px;
+    animation: fadeIn 0.28s ease-out;
+}
+
+.runtime-slot-card::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 4px;
+    height: 100%;
+    background: #8b949e;
+}
+
+.runtime-slot-ok::before { background: var(--accent-green); }
+.runtime-slot-warn::before { background: var(--accent-yellow); }
+.runtime-slot-bad::before { background: #ff7b72; }
+
+.runtime-badge-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+    margin: 12px 0;
+}
+
+.runtime-badge {
+    display: inline-flex;
+    align-items: center;
+    width: fit-content;
+    border-radius: 999px;
+    padding: 3px 9px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    border: 1px solid currentColor;
+}
+
+.runtime-badge-ok { color: var(--accent-green); background: rgba(52, 211, 153, 0.12); }
+.runtime-badge-warn { color: var(--accent-yellow); background: rgba(251, 191, 36, 0.12); }
+.runtime-badge-bad { color: #ff7b72; background: rgba(255, 123, 114, 0.12); }
+.runtime-badge-neutral { color: #8b949e; background: rgba(139, 148, 158, 0.12); }
+
+.runtime-kv {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 14px;
+    margin: 0;
+}
+
+.runtime-kv div {
+    min-width: 0;
+}
+
+.runtime-kv dt {
+    color: #7d8590;
+    font-size: 0.74rem;
+}
+
+.runtime-kv dd {
+    overflow: hidden;
+    margin: 3px 0 0 0;
+    color: var(--text-main);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.runtime-task-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.runtime-task-card p {
+    margin: 10px 0;
+    color: #9aa7b7;
+}
+
+.runtime-progress {
+    margin-top: 9px;
+}
+
+.runtime-progress-meta {
+    margin-bottom: 4px;
+    color: #8b949e;
+    font-size: 0.76rem;
+}
+
+.runtime-progress-track {
+    height: 7px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #0a0f16;
+    border: 1px solid rgba(48, 54, 61, 0.7);
+}
+
+.runtime-progress-track div {
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, var(--edge-color), var(--cloud-color));
+}
+
+.runtime-progress-pair {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px 10px;
+}
+
+.runtime-task-foot {
+    margin-top: 12px;
+    color: #7d8590;
+    font-size: 0.78rem;
+}
+
+.runtime-history-block {
+    margin-top: 12px;
+    padding: 12px;
+    border: 1px solid rgba(139, 148, 158, 0.25);
+    border-radius: 12px;
+    background: rgba(13, 17, 23, 0.58);
+}
+
+.runtime-history-title {
+    margin-bottom: 8px;
+    color: #8b949e;
+    font-size: 0.78rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+}
+
+.runtime-history-item {
+    display: grid;
+    grid-template-columns: 110px minmax(0, 1fr);
+    gap: 10px;
+    padding: 7px 0;
+    border-top: 1px solid rgba(48, 54, 61, 0.6);
+}
+
+.runtime-history-item span {
+    color: #ffb4ad;
+    font-weight: 700;
+}
+
+.runtime-history-item small {
+    overflow: hidden;
+    color: #8b949e;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.runtime-inline-error {
+    margin-top: 10px;
+    padding: 8px 10px;
+    color: #ffb4ad;
+    background: rgba(255, 123, 114, 0.1);
+    border: 1px solid rgba(255, 123, 114, 0.28);
+    border-radius: 8px;
+    font-size: 0.82rem;
+}
+
+.runtime-table-wrap {
+    overflow-x: auto;
+}
+
+.runtime-table th,
+.runtime-table td {
+    white-space: nowrap;
+}
+
+.runtime-empty-card {
+    padding: 18px;
+    color: #8b949e;
+    text-align: center;
+}
+
+@media (max-width: 1180px) {
+    .runtime-summary-grid {
+        grid-template-columns: repeat(3, minmax(160px, 1fr));
+    }
+    .runtime-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 760px) {
+    .runtime-hero,
+    .runtime-actions {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+    .runtime-summary-grid,
+    .runtime-progress-pair,
+    .runtime-kv {
+        grid-template-columns: 1fr;
+    }
+}

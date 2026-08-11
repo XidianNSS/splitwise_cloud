@@ -36,14 +36,47 @@ apply_wyy_port_override_if_needed() {
     ensure_port_available "$configured_port" "backend"
 }
 
-VENV_PATH="$PROJECT_ROOT/venv/bin/activate"
-if [ -f "$VENV_PATH" ]; then
-    echo "📦 正在激活虚拟环境..."
-    source "$VENV_PATH"
-else
-    echo "🚨 错误: 未找到虚拟环境 ($VENV_PATH)！"
-    exit 1
-fi
+activate_backend_python_env() {
+    local backend_conda_env="${BACKEND_CONDA_ENV:-${CONDA_ENV_NAME:-splitwise_backend}}"
+    local conda_base=""
+
+    if command -v conda >/dev/null 2>&1; then
+        conda_base="$(conda info --base 2>/dev/null || true)"
+    fi
+
+    if [ -z "$conda_base" ]; then
+        for candidate in /home/miniconda3 /root/miniconda3 /opt/conda /home/wyy/miniconda3 /home/wyy/anaconda3; do
+            if [ -f "$candidate/etc/profile.d/conda.sh" ]; then
+                conda_base="$candidate"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$conda_base" ] && [ -f "$conda_base/etc/profile.d/conda.sh" ]; then
+        echo "📦 正在激活 Conda 环境: $backend_conda_env"
+        # shellcheck disable=SC1090
+        source "$conda_base/etc/profile.d/conda.sh"
+        conda activate "$backend_conda_env"
+    elif [ -f "$PROJECT_ROOT/venv/bin/activate" ]; then
+        echo "⚠️ 未找到 conda，回退到项目 venv。"
+        # shellcheck disable=SC1091
+        source "$PROJECT_ROOT/venv/bin/activate"
+    else
+        echo "🚨 错误: 未找到 Conda 环境，也未找到项目 venv。"
+        echo "💡 默认需要 Conda 环境: splitwise_backend"
+        echo "💡 或指定: BACKEND_CONDA_ENV=xxx BACKEND_ENV_FILE=backend/.env.prod bash scripts/run_server.sh"
+        exit 1
+    fi
+
+    echo "🐍 Python: $(command -v python)"
+    python - <<'PY'
+import sys
+print("🐍 sys.executable:", sys.executable)
+PY
+}
+
+activate_backend_python_env
 
 echo "🌐 正在拉起 FastAPI 服务与监控大屏..."
 if [ -z "${BACKEND_ENV_FILE:-}" ] && [ -f "$WYY_ENV_PATH" ]; then

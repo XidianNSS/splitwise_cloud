@@ -54,16 +54,38 @@ class Settings:
     CLOUD_RUNTIME_MOCK_PORT: int = int(os.getenv("CLOUD_RUNTIME_MOCK_PORT", os.getenv("CLOUD_RUNTIME_PORT", "18002")))
     MODEL_STARTUP_RESOURCE_CHECK_ENABLED: bool = env_bool("MODEL_STARTUP_RESOURCE_CHECK_ENABLED", True)
     MODEL_STARTUP_MAX_MEMORY_PERCENT: float = float(os.getenv("MODEL_STARTUP_MAX_MEMORY_PERCENT", 95.0))
-    MODELSPLIT_DEV_ROOT: str = os.getenv("MODELSPLIT_DEV_ROOT", "/home/nss-d/wyy/ModelSplit_dev")
+    MODELSPLIT_DEV_ROOT: str = os.getenv("MODELSPLIT_DEV_ROOT", "/home/wyy/workspace/ModelSplit")
     CLOUD_SLOT_HTTP_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_HTTP_BASE_PORT", "19113"))
     CLOUD_SLOT_GRPC_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_GRPC_BASE_PORT", "52163"))
     CLOUD_SLOT_MAX_COUNT: int = int(os.getenv("CLOUD_SLOT_MAX_COUNT", "4"))
+
+    # 多 cloud slot 的 NPU 绑定表。
+    # 例如 CLOUD_SLOT_NPU_DEVICES=0,1 表示：
+    #   cloud-slot-0 -> npu:0
+    #   cloud-slot-1 -> npu:1
+    CLOUD_SLOT_NPU_DEVICES: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv("CLOUD_SLOT_NPU_DEVICES", "").split(",")
+        if item.strip()
+    )
+
+    # 默认不允许多个 cloud slot 共享同一张 NPU，避免无意中显存互抢。
+    CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION: bool = env_bool(
+        "CLOUD_SLOT_ALLOW_NPU_OVERSUBSCRIPTION",
+        False,
+    )
+
     CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS: int = int(os.getenv("CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS", "30"))
+    CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS: float = float(os.getenv("CLOUD_SLOT_STARTUP_TIMEOUT_SECONDS", "90"))
+    CLOUD_SLOT_STARTUP_BACKOFF_BASE_SECONDS: int = int(os.getenv("CLOUD_SLOT_STARTUP_BACKOFF_BASE_SECONDS", "15"))
+    CLOUD_SLOT_STARTUP_BACKOFF_MAX_SECONDS: int = int(os.getenv("CLOUD_SLOT_STARTUP_BACKOFF_MAX_SECONDS", "300"))
+    RUNTIME_SLOT_WAIT_TIMEOUT_SECONDS: int = int(os.getenv("RUNTIME_SLOT_WAIT_TIMEOUT_SECONDS", "900"))
     RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS: float = float(os.getenv("RUNTIME_SLOT_RECONCILE_INTERVAL_SECONDS", "5"))
+    RUNTIME_RELEASE_GRACE_SECONDS: int = int(os.getenv("RUNTIME_RELEASE_GRACE_SECONDS", "7200"))
     RUNTIME_CONFIRMATION_PATH: str = os.getenv("RUNTIME_CONFIRMATION_PATH", "/api/v1/runtime/confirmation/cloud")
     RUNTIME_CONFIRMATION_FORWARD_TIMEOUT_SECONDS: float = float(os.getenv("RUNTIME_CONFIRMATION_FORWARD_TIMEOUT_SECONDS", "30"))
 
-    PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.2:9090")
+    PROMETHEUS_URL: str = os.getenv("PROMETHEUS_URL", "http://10.144.144.4:9091")
     ALGORITHM_USE_MOCK: bool = env_bool("ALGORITHM_USE_MOCK", False)
     ALGORITHM_REAL_API_URL: str = os.getenv("ALGORITHM_REAL_API_URL", "http://127.0.0.1:8050/infer")
     ALGORITHM_MOCK_API_URL: str = os.getenv("ALGORITHM_MOCK_API_URL", "http://127.0.0.1:5000/infer")
@@ -88,6 +110,15 @@ class Settings:
     NETWORK_PROBE_CACHE_SECONDS: float = float(os.getenv("NETWORK_PROBE_CACHE_SECONDS", 30.0))
     NETWORK_MAX_CONCURRENT_PROBES: int = int(os.getenv("NETWORK_MAX_CONCURRENT_PROBES", 5))
     FRONTEND_DIR: Path = PROJECT_ROOT / "frontend"
+
+    MODELSPLIT_PYTHON_BIN: str = os.getenv(
+        "MODELSPLIT_PYTHON_BIN",
+        "/home/miniconda3/envs/modelsplit/bin/python",
+    )
+    ASCEND_ENV_SCRIPT: str = os.getenv(
+        "ASCEND_ENV_SCRIPT",
+        "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+    )
 
 
 settings = Settings()

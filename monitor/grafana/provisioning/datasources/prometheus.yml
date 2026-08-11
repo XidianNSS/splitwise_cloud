@@ -1,0 +1,14 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9091
+    isDefault: true
+    editable: true
+
+volumes:
+  - grafana_data:/var/lib/grafana
+  - ./grafana/provisioning:/etc/grafana/provisioning
+  - ./grafana/dashboards:/var/lib/grafana/dashboards

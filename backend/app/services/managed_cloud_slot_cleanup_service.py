@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models.models import RuntimeSlot
 from app.services.decode_server_process_manager import stop_slot_process
-from app.services.runtime_slot_service import update_runtime_slot_state
+from app.services.runtime_state_transition_service import transition_runtime_slot
 
 
 def is_backend_managed_cloud_slot(slot: RuntimeSlot) -> bool:
@@ -26,6 +26,7 @@ def clear_slot_owner_fields() -> dict:
         "confirmation_status": "none",
         "idle_deadline": None,
         "process_idle_deadline": None,
+        "startup_deadline": None,
         "last_used_at": datetime.utcnow(),
     }
 
@@ -34,7 +35,7 @@ def clear_slot_ownership(db: Session, slot: RuntimeSlot, *, process_state: str |
     fields = clear_slot_owner_fields()
     if process_state is not None:
         fields["process_state"] = process_state
-    return update_runtime_slot_state(db, slot, **fields)
+    return transition_runtime_slot(db, slot, **fields)
 
 
 def _mark_managed_cloud_slot_stop_failed(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
@@ -45,7 +46,7 @@ def _mark_managed_cloud_slot_stop_failed(db: Session, slot: RuntimeSlot) -> Runt
         "model_state": "failed",
         "process_pid": slot.process_pid,
     })
-    return update_runtime_slot_state(db, slot, **fields)
+    return transition_runtime_slot(db, slot, **fields)
 
 
 def _mark_managed_cloud_slot_stopped(db: Session, slot: RuntimeSlot) -> RuntimeSlot:
@@ -53,8 +54,10 @@ def _mark_managed_cloud_slot_stopped(db: Session, slot: RuntimeSlot) -> RuntimeS
     fields.update({
         "process_state": "stopped",
         "process_pid": None,
+        "control_url": None,
+        "grpc_target": None,
     })
-    return update_runtime_slot_state(db, slot, **fields)
+    return transition_runtime_slot(db, slot, **fields)
 
 
 def stop_and_clear_managed_cloud_slot(db: Session, slot: RuntimeSlot) -> tuple[RuntimeSlot, bool]:

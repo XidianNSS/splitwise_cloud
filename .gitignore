@@ -5,14 +5,14 @@ __pycache__/
 # 虚拟环境 (绝对不能传到 Git！)
 venv/
 .venv/
+.python/
 
 # 配置文件
 backend/.env
 monitor/.env
 
-# 数据库文件 (保护用户数据)
-data/*.db
-data/*.sqlite3
+# 运行数据库与备份（保护用户数据）
+/data/
 
 # IDE 配置
 .idea/

@@ -112,6 +112,10 @@ def serialize_runtime_slot(slot) -> dict:
         "last_used_at": _iso(slot.last_used_at),
         "idle_deadline": _iso(slot.idle_deadline),
         "process_idle_deadline": _iso(slot.process_idle_deadline),
+        "startup_deadline": _iso(getattr(slot, "startup_deadline", None)),
+        "startup_failure_count": int(getattr(slot, "startup_failure_count", 0) or 0),
+        "retry_after": _iso(getattr(slot, "retry_after", None)),
+        "last_error": getattr(slot, "last_error", None),
         "created_at": _iso(slot.created_at),
         "updated_at": _iso(slot.updated_at),
     }

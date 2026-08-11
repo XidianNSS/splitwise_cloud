@@ -4,7 +4,11 @@ import logging
 import httpx
 
 from app.core.config import settings
-from app.services.model_registry import MODEL_REGISTRY
+from app.services.model_registry import (
+    MODEL_REGISTRY,
+    build_fixed_runtime_decision,
+    uses_fixed_runtime_strategy,
+)
 
 logger = logging.getLogger("AlgorithmDispatcher")
 
@@ -12,8 +16,14 @@ DEFAULT_PROMPT_LEN = 96
 
 
 def normalize_device_runtime_label(metrics: dict) -> str:
-    gpu_mem_total_mb = float(metrics.get("gpu_mem_total_mb", 0.0) or 0.0)
-    return "cuda:0" if gpu_mem_total_mb > 1.0 else "cpu"
+    total_mb = float(metrics.get("gpu_mem_total_mb", 0.0) or 0.0)
+    if total_mb <= 1.0:
+        return "cpu"
+
+    if metrics.get("accelerator_type") == "ascend":
+        return "npu:0"
+
+    return "cuda:0"
 
 
 def build_algorithm_request_payload(
@@ -118,7 +128,7 @@ async def request_algorithm_decision(task_id: str, model_type: str, raw_input_js
         json.dumps(raw_input_json, ensure_ascii=False),
     )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.post(
             settings.ALGORITHM_API_URL,
             json=raw_input_json,
@@ -133,3 +143,21 @@ async def request_algorithm_decision(task_id: str, model_type: str, raw_input_js
         json.dumps(decision_result, ensure_ascii=False),
     )
     return decision_result
+
+
+async def resolve_runtime_decision(
+    task_id: str,
+    model_type: str,
+    model_type_key: str,
+    raw_input_json: dict,
+) -> dict:
+    """Resolve either a deterministic protocol or an algorithm decision."""
+    if uses_fixed_runtime_strategy(model_type_key):
+        decision = build_fixed_runtime_decision(model_type, model_type_key)
+        logger.info(
+            "使用固定 runtime 协议，跳过切分算法服务: task_id=%s model=%s",
+            task_id,
+            model_type,
+        )
+        return decision
+    return await request_algorithm_decision(task_id, model_type, raw_input_json)

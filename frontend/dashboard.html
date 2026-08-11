@@ -38,8 +38,73 @@
             <iframe id="grafana-frame" src="" title="Grafana Monitor" style="border-radius: 8px; flex: 1;"></iframe>
         </div>
         <div id="view-sandbox" class="view-section">
-            <div style="flex: 1; border: 2px dashed #30363d; border-radius: 8px; display: flex; align-items: center; justify-content: center; color: #8b949e; background: rgba(0,0,0,0.2);">
-                <h2>沙盘核心交互区域 (待开发)</h2>
+            <div class="runtime-shell">
+                <section class="runtime-hero">
+                    <div>
+                        <div class="runtime-kicker">Cloud Runtime Control Plane</div>
+                        <h2>云端运行态总览</h2>
+                        <p>实时展示云端托管的 decode_server、边云绑定、任务阶段与异常状态。</p>
+                    </div>
+                    <div class="runtime-actions">
+                        <span id="runtime-refresh-status">等待刷新</span>
+                        <button class="runtime-refresh-btn" onclick="refreshRuntimeOverview()">刷新运行态</button>
+                    </div>
+                </section>
+
+                <section id="runtime-summary-grid" class="runtime-summary-grid">
+                    <div class="runtime-empty-card">运行态数据加载中...</div>
+                </section>
+
+                <section id="runtime-alerts" class="runtime-alerts"></section>
+
+                <section class="runtime-grid">
+                    <div class="runtime-panel runtime-panel-wide">
+                        <div class="runtime-panel-header">
+                            <div>
+                                <span class="runtime-section-label">Decode Fleet</span>
+                                <h3>云端 decode_server 托管列表</h3>
+                            </div>
+                            <span id="runtime-slot-count" class="runtime-muted">0 slots</span>
+                        </div>
+                        <div id="runtime-cloud-slots" class="runtime-slot-grid"></div>
+                    </div>
+
+                    <div class="runtime-panel">
+                        <div class="runtime-panel-header">
+                            <div>
+                                <span class="runtime-section-label">Task Pipeline</span>
+                                <h3>任务阶段</h3>
+                            </div>
+                        </div>
+                        <div id="runtime-task-timeline" class="runtime-task-list"></div>
+                    </div>
+                </section>
+
+                <section class="runtime-panel">
+                    <div class="runtime-panel-header">
+                        <div>
+                            <span class="runtime-section-label">Bindings</span>
+                            <h3>边端 Session 与 Cloud Slot 绑定</h3>
+                        </div>
+                    </div>
+                    <div class="runtime-table-wrap">
+                        <table class="runtime-table">
+                            <thead>
+                                <tr>
+                                    <th>Session</th>
+                                    <th>边端设备</th>
+                                    <th>Edge Slot</th>
+                                    <th>Cloud Slot</th>
+                                    <th>Task</th>
+                                    <th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody id="runtime-binding-table">
+                                <tr><td colspan="6">运行态数据加载中...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
             </div>
         </div>
     </div>
@@ -130,6 +195,6 @@
             </div>
         </div>
     </div>
-    <script src="/static/dashboard.js" defer></script>
+    <script src="/static/dashboard.js?v=runtime-dashboard-20260618-runtime-state-fix" defer></script>
 </body>
 </html>

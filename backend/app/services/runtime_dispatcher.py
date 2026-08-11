@@ -41,7 +41,7 @@ async def dispatch_strategy_to_runtime(
     control_url: str | None = None,
 ) -> dict:
     runtime_url = control_url or build_runtime_control_url(node_role, device_ip)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.post(runtime_url, json=payload, timeout=5.0)
         response.raise_for_status()
         if response.content:

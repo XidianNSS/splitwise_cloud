@@ -78,6 +78,33 @@ def resolve_accelerator_type(ip: str) -> str:
     return "ascend" if ip in settings.ASCEND_IPS else "nvidia"
 
 
+def _apply_best_available_chip_view(metrics: dict) -> dict:
+    """
+    调度算法请求体保持原格式，但多卡机器的顶层显存字段使用“最大可用单卡”视图。
+
+    这样策略模块不会把多卡 HBM 聚合值误认为单个 runtime 可用显存；完整分卡数据仍保留在
+    chips 中，便于排查和后续做精确 slot/NPU 绑定。
+    """
+    chips = metrics.get("chips") or []
+    candidates = []
+    for chip in chips:
+        total_mb = float(chip.get("total_mb", 0.0) or 0.0)
+        used_mb = float(chip.get("used_mb", 0.0) or 0.0)
+        if total_mb <= 0:
+            continue
+        candidates.append((max(total_mb - used_mb, 0.0), total_mb, used_mb, chip))
+
+    if not candidates:
+        return metrics
+
+    _free_mb, total_mb, used_mb, best_chip = max(candidates, key=lambda item: item[0])
+    metrics["gpu_mem_used_mb"] = round(used_mb, 2)
+    metrics["gpu_mem_total_mb"] = round(total_mb, 2)
+    if "util" in best_chip:
+        metrics["gpu_util_percent"] = round(float(best_chip.get("util") or 0.0), 2)
+    return metrics
+
+
 async def query_prom(client: httpx.AsyncClient, query: str) -> float:
     try:
         response = await client.get(
@@ -120,7 +147,7 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
     chip_templates = PER_CHIP_QUERY_TEMPLATES.get(accelerator_type, {})
     chip_queries = {name: tpl.format(ip_regex=ip_regex) for name, tpl in chip_templates.items()}
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         agg_results = await asyncio.gather(*(query_prom(client, q) for q in agg_queries.values()))
         chip_series_results = await asyncio.gather(
             *(query_prom_series(client, q) for q in chip_queries.values())
@@ -148,16 +175,16 @@ async def fetch_metrics_from_prometheus(ip: str) -> dict:
                         entry.setdefault(label_key, s["labels"][label_key])
                 entry[metric_name] = round(s["value"], 2)
 
-    return {
+    metrics = {
         "cpu_percent": round(cpu, 2),
         "memory_percent": round(mem, 2),
         "gpu_util_percent": round(gpu_util, 2),
         "gpu_mem_used_mb": round(gpu_used, 2),
-        "gpu_mem_total_mb": round(gpu_used + gpu_free, 2) if (gpu_used + gpu_free) > 0 else 1.0,
         "gpu_mem_total_mb": round(gpu_total, 2) if gpu_total > 0 else 1.0,
         "accelerator_type": accelerator_type,
         "chips": sorted(chips.values(), key=lambda c: c["chip_id"]),
     }
+    return _apply_best_available_chip_view(metrics)
 
 
 async def get_prometheus_metrics(ip: str) -> dict:

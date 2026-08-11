@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.models import RuntimeSlot
 from app.schemas.schemas import CloudRuntimeConfirmationRequest
-from app.services.runtime_slot_service import update_runtime_slot_state
+from app.services.runtime_state_transition_service import transition_runtime_slot
 
 logger = logging.getLogger("RuntimeControlService")
 
@@ -20,7 +20,7 @@ async def fetch_runtime_state(slot: RuntimeSlot, *, timeout: float = 5.0) -> dic
     if not slot.control_url:
         raise RuntimeError(f"runtime slot {slot.slot_id} 缺少 control_url")
     base_url = slot.control_url.removesuffix("/load_strategy")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.get(f"{base_url}/runtime_state", timeout=timeout)
         response.raise_for_status()
         return response.json()
@@ -32,18 +32,29 @@ async def unload_runtime_slot(
     *,
     reason: str,
     timeout: float = 10.0,
+    preserve_reservation: bool = False,
 ) -> dict:
     if not slot.control_url:
         raise RuntimeError(f"runtime slot {slot.slot_id} 缺少 control_url")
     base_url = slot.control_url.removesuffix("/load_strategy")
-    update_runtime_slot_state(
+    logger.warning(
+        "准备卸载 runtime slot: slot_id=%s role=%s owner_session=%s binding=%s task=%s target=%s reason=%s",
+        slot.slot_id,
+        slot.role,
+        slot.owner_session_id,
+        slot.owner_binding_id,
+        slot.task_id,
+        f"{base_url}/unload_model",
+        reason,
+    )
+    transition_runtime_slot(
         db,
         slot,
         slot_state="unloading",
         model_state="draining",
         last_used_at=datetime.utcnow(),
     )
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         response = await client.post(
             f"{base_url}/unload_model",
             json={"reason": reason},
@@ -55,21 +66,34 @@ async def unload_runtime_slot(
     process_idle_deadline = None
     if bool(getattr(slot, "spawned_by_scheduler", 0)):
         process_idle_deadline = datetime.utcnow() + timedelta(seconds=settings.CLOUD_SLOT_PROCESS_IDLE_TIMEOUT_SECONDS)
-    update_runtime_slot_state(
-        db,
-        slot,
-        slot_state="free",
-        model_state="empty",
-        owner_session_id=None,
-        owner_binding_id=None,
-        model_type=None,
-        task_id=None,
-        active_request_count=0,
-        confirmation_status="none",
-        idle_deadline=idle_deadline,
-        process_idle_deadline=process_idle_deadline,
-        last_used_at=datetime.utcnow(),
-    )
+    if preserve_reservation:
+        transition_runtime_slot(
+            db,
+            slot,
+            slot_state="bound",
+            model_state="loading",
+            active_request_count=0,
+            confirmation_status="none",
+            idle_deadline=None,
+            process_idle_deadline=None,
+            last_used_at=datetime.utcnow(),
+        )
+    else:
+        transition_runtime_slot(
+            db,
+            slot,
+            slot_state="free",
+            model_state="empty",
+            owner_session_id=None,
+            owner_binding_id=None,
+            model_type=None,
+            task_id=None,
+            active_request_count=0,
+            confirmation_status="none",
+            idle_deadline=idle_deadline,
+            process_idle_deadline=process_idle_deadline,
+            last_used_at=datetime.utcnow(),
+        )
     return payload
 
 
@@ -103,7 +127,7 @@ async def forward_cloud_confirmation_to_edge(
         timeout,
     )
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 target_url,
                 json=request_payload,

@@ -67,8 +67,14 @@ async def get_prometheus_targets(job_type: str, db: Session = Depends(get_db)):
             labels = {
                 "device_id": dev.id,
                 "device_name": dev.name,
+                "device_type": dev.device_type,
             }
-            if job_type == "npu":
+            if job_type == "node":
+                labels["exporter_type"] = "node_exporter"
+            elif job_type == "gpu":
+                labels["exporter_type"] = "dcgm_exporter"
+            elif job_type == "npu":
+                labels["exporter_type"] = "ascend_npu_exporter"
                 labels["accelerator_type"] = "ascend"
 
             targets_list.append({

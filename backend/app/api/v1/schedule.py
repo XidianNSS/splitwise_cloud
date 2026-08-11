@@ -20,6 +20,7 @@ from app.schemas.schemas import (
     CloudRuntimeConfirmationRequest,
     CloudRuntimeConfirmationResponse,
     EdgeTriggerRequest,
+    ModelCatalogEntry,
     RuntimeProgressCallbackRequest,
     RuntimeBindingStatusResponse,
     RuntimeSlotStatusResponse,
@@ -31,9 +32,16 @@ from app.services.schedule_orchestrator import (
     TASK_TERMINAL_STATUSES,
     accept_schedule_task,
     handle_runtime_progress,
+    resolve_current_runtime_allocation,
 )
+from app.services.model_registry import canonicalize_model_type, list_model_catalog
 from app.services.schedule_queue import LOADING_RUNNING_STATUS, WAITING_CLOUD_SLOT_STATUS
 from app.services.runtime_control_service import forward_cloud_confirmation_to_edge
+from app.services.runtime_state_transition_service import (
+    RuntimeAllocationIdentity,
+    RuntimeTransitionConflict,
+    transition_runtime_slot,
+)
 from app.services.schedule_presenter import (
     build_strategy_display_layer_partitions,
     build_strategy_display_summary,
@@ -44,6 +52,14 @@ from app.services.schedule_presenter import (
 
 router = APIRouter()
 logger = logging.getLogger("ScheduleRouter")
+
+
+@router.get("/models", response_model=list[ModelCatalogEntry], summary="查询可调度模型及其能力")
+async def list_schedule_models(
+    current_openwebui_user_id: str = Depends(get_current_openwebui_user_id),
+):
+    _ = current_openwebui_user_id
+    return list_model_catalog()
 
 
 def decode_query_token_to_openwebui_user_id(token: str) -> str:
@@ -159,6 +175,9 @@ async def get_schedule_task_strategy(
             "layer_partitions": display_layers,
             "edge_head_count_total": display_summary["edge_head_count_total"],
             "cloud_head_count_total": display_summary["cloud_head_count_total"],
+            "strategy_kind": decision.get("strategy_kind"),
+            "capability": decision.get("capability"),
+            "deployment_mode": decision.get("deployment_mode"),
         },
     }
 
@@ -173,18 +192,59 @@ async def confirm_cloud_runtime_integrity(
     _verified: None = Depends(verify_runtime_integrity_token),
     db: Session = Depends(get_db),
 ):
-    task = db.query(ScheduleTask).filter(ScheduleTask.task_id == payload.task_id).first()
-    if not task:
+    cloud_context, stale_reason = resolve_current_runtime_allocation(
+        db,
+        task_id=payload.task_id,
+        node_role="cloud",
+    )
+    if cloud_context is None and stale_reason == "task not found":
         raise HTTPException(status_code=404, detail="未找到对应的调度任务")
-    if payload.cloud_slot_id and task.allocated_cloud_slot_id and payload.cloud_slot_id != task.allocated_cloud_slot_id:
-        raise HTTPException(status_code=409, detail="cloud_slot_id 与任务分配不一致")
+    if cloud_context is None:
+        logger.warning(
+            "忽略非当前 allocation 的 cloud confirmation: task_id=%s reason=%s",
+            payload.task_id,
+            stale_reason,
+        )
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason=f"stale allocation ignored: {stale_reason}",
+        )
 
-    cloud_slot_id = task.allocated_cloud_slot_id or task.cloud_slot_id
-    edge_slot_id = task.edge_slot_id
-    cloud_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == cloud_slot_id).first() if cloud_slot_id else None
-    edge_slot = db.query(RuntimeSlot).filter(RuntimeSlot.slot_id == edge_slot_id).first() if edge_slot_id else None
-    if cloud_slot is None or edge_slot is None:
-        raise HTTPException(status_code=409, detail="任务对应的 runtime slot 不完整")
+    edge_context, edge_reason = resolve_current_runtime_allocation(
+        db,
+        task_id=payload.task_id,
+        node_role="edge",
+    )
+    if edge_context is None:
+        logger.warning(
+            "忽略缺少当前 edge allocation 的 cloud confirmation: task_id=%s reason=%s",
+            payload.task_id,
+            edge_reason,
+        )
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason=f"stale edge allocation ignored: {edge_reason}",
+        )
+
+    task = cloud_context.task
+    cloud_slot = cloud_context.slot
+    edge_slot = edge_context.slot
+    cloud_slot_id = cloud_slot.slot_id
+    edge_slot_id = edge_slot.slot_id
+    if payload.cloud_slot_id != cloud_slot_id:
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason="stale allocation ignored: cloud_slot_id mismatch",
+        )
+    if (
+        payload.model_type
+        and canonicalize_model_type(payload.model_type)
+        != canonicalize_model_type(task.model_type)
+    ):
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason="stale allocation ignored: model_type mismatch",
+        )
 
     logger.info(
         "Received cloud confirmation: task_id=%s cloud_slot_id=%s allocated_cloud_slot_id=%s edge_slot_id=%s",
@@ -198,6 +258,37 @@ async def confirm_cloud_runtime_integrity(
         payload=payload,
     )
 
+    db.rollback()
+    refreshed_cloud_context, refreshed_reason = resolve_current_runtime_allocation(
+        db,
+        task_id=payload.task_id,
+        node_role="cloud",
+    )
+    refreshed_edge_context, refreshed_edge_reason = resolve_current_runtime_allocation(
+        db,
+        task_id=payload.task_id,
+        node_role="edge",
+    )
+    if refreshed_cloud_context is None or refreshed_edge_context is None:
+        stale_after_forward = refreshed_reason if refreshed_cloud_context is None else refreshed_edge_reason
+        logger.warning(
+            "cloud confirmation 转发期间 allocation 已变化，忽略结果: task_id=%s reason=%s",
+            payload.task_id,
+            stale_after_forward,
+        )
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason=f"stale allocation ignored after forwarding: {stale_after_forward}",
+        )
+    if (
+        refreshed_cloud_context.slot.slot_id != cloud_slot_id
+        or refreshed_edge_context.slot.slot_id != edge_slot_id
+    ):
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason="stale allocation ignored after forwarding: slot mapping changed",
+        )
+
     logger.info(
         "Cloud confirmation result: task_id=%s cloud_slot_id=%s edge_slot_id=%s matched=%s reason=%s",
         payload.task_id,
@@ -207,12 +298,22 @@ async def confirm_cloud_runtime_integrity(
         reason,
     )
 
-    if matched:
-        cloud_slot.confirmation_status = "passed"
-    else:
-        cloud_slot.confirmation_status = "failed"
-    db.add(cloud_slot)
-    db.commit()
+    try:
+        transition_runtime_slot(
+            db,
+            refreshed_cloud_context.slot,
+            expected_allocation=RuntimeAllocationIdentity(
+                session_id=refreshed_cloud_context.session.session_id,
+                binding_id=refreshed_cloud_context.binding.binding_id,
+                task_id=payload.task_id,
+            ),
+            confirmation_status="passed" if matched else "failed",
+        )
+    except RuntimeTransitionConflict:
+        return CloudRuntimeConfirmationResponse(
+            matched=False,
+            reason="stale allocation ignored while committing confirmation",
+        )
 
     return CloudRuntimeConfirmationResponse(matched=matched, reason=reason)
 
@@ -251,7 +352,10 @@ async def stream_schedule_task_status(task_id: str, token: str = Query(...)):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @router.post("/runtime_callback/edge", summary="【推理节点专用】接收边端模型加载进度回调")
-async def receive_edge_runtime_progress(payload: RuntimeProgressCallbackRequest):
+async def receive_edge_runtime_progress(
+    payload: RuntimeProgressCallbackRequest,
+    _verified: None = Depends(verify_runtime_integrity_token),
+):
     result = await handle_runtime_progress(payload, callback_role="edge")
     if result.get("status") == "error":
         raise HTTPException(status_code=result.get("http_status", 400), detail=result["message"])
@@ -259,7 +363,10 @@ async def receive_edge_runtime_progress(payload: RuntimeProgressCallbackRequest)
 
 
 @router.post("/runtime_callback/cloud", summary="【推理节点专用】接收云端模型加载进度回调")
-async def receive_cloud_runtime_progress(payload: RuntimeProgressCallbackRequest):
+async def receive_cloud_runtime_progress(
+    payload: RuntimeProgressCallbackRequest,
+    _verified: None = Depends(verify_runtime_integrity_token),
+):
     result = await handle_runtime_progress(payload, callback_role="cloud")
     if result.get("status") == "error":
         raise HTTPException(status_code=result.get("http_status", 400), detail=result["message"])
