@@ -2619,14 +2619,17 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
 
         db = SessionLocal()
         try:
-            with patch("app.api.v1.schedule.forward_cloud_confirmation_to_edge", new=AsyncMock(return_value=(True, None))):
+            with patch(
+                "app.api.v1.schedule.forward_cloud_confirmation_to_edge",
+                new=AsyncMock(return_value=(True, None)),
+            ) as forward_mock:
                 response = asyncio.run(confirm_cloud_runtime_integrity(
                     CloudRuntimeConfirmationRequest(
                         task_id="task-confirm",
                         cloud_slot_id="cloud-slot-1",
                         model_type="Llama-3.2-3B-Instruct",
-                        server_param_digest="sha256:server",
-                        partition_digest="sha256:partition",
+                        server_param_digest="d" * 64,
+                        partition_digest="e" * 64,
                         timestamp=1234567890,
                         nonce="nonce-1",
                     ),
@@ -2637,6 +2640,9 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
             db.close()
 
         self.assertTrue(response.matched)
+        forwarded_payload = forward_mock.await_args.kwargs["payload"]
+        self.assertEqual(forwarded_payload.server_param_digest, "d" * 64)
+        self.assertEqual(forwarded_payload.partition_digest, "e" * 64)
 
         db = SessionLocal()
         try:

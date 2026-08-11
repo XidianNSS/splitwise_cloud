@@ -228,7 +228,13 @@ POST /integrity/cloud_confirmation
 {"matched":true,"reason":null}
 ```
 
-BERT 使用同一确认拓扑，但 digest 来源不同：正常 BERT 校验 `config.json + model.safetensors` bundle，混淆 BERT 校验部署 artifact fingerprint；两侧还必须匹配 partition digest。正式注册表按角色隔离：prefill 可持有 `client_secret`，decode 只持有 `server_dir`/artifact fingerprint，coordinator/OpenAI 不得包含 `encrypted_model`。
+BERT 使用同一确认拓扑，但 digest 来源不同：normal Edge 实测 tokenizer、normal
+Cloud 实测 `config.json + model.safetensors`，两侧分别与相同的
+`normal_model_identity` 比对后生成一致的组合 `server_param_digest`；混淆 BERT 仍使用
+部署 artifact fingerprint。backend 把该摘要视为不透明值原样转发，不解析组成，因此
+不需要数据库迁移。两种模式都必须同时匹配 partition digest。正式注册表按角色隔离：
+prefill 可持有 `client_secret`，decode 只持有 `server_dir`/artifact fingerprint，
+coordinator/OpenAI 不得包含 `encrypted_model`。
 
 ## 7. 联调检查
 

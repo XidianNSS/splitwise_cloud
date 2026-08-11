@@ -70,6 +70,7 @@ class ModelCatalogEntry(BaseModel):
     runtime_model_type: str
     architecture: str
     capability: str
+    capabilities: List[str]
     deployment_mode: str
     strategy_kind: str
 

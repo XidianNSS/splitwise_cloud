@@ -166,10 +166,11 @@ BACKEND_ENV_FILE=backend/.env.local bash scripts/run_server.sh
 | `CLOUD_SLOT_*` | slot 数量、HTTP/gRPC 端口、设备和回收时间 |
 | `RUNTIME_INTEGRITY_TOKEN` | backend/runtime 共享的进度与完整性回调 token |
 
-`GET /api/v1/schedule/models` 返回每个模型的 `capability`、`deployment_mode`
-和 `strategy_kind`。`BERT-Base-Uncased` 当前为 `embeddings + encrypted +
-fixed_bert_encoder`；它仍经过资源预检查、slot 分配、加载、完整性确认和回收，
-但不会调用 Llama/Qwen 切分算法。
+`GET /api/v1/schedule/models` 返回每个模型的兼容字段 `capability`、能力数组
+`capabilities`、`deployment_mode` 和 `strategy_kind`。`BERT-Base-Uncased` 当前提供
+`embeddings` 与 `text_classification`，正式部署为 `encrypted + fixed_bert_encoder`；
+它仍经过资源预检查、slot 分配、加载、完整性确认和回收，但不会调用 Llama/Qwen
+切分算法。
 
 当前 scheduler catalog 与 ModelSplit runtime 的关系如下：
 
@@ -177,7 +178,7 @@ fixed_bert_encoder`；它仍经过资源预检查、slot 分配、加载、完�
 |---|---|---|
 | `Llama-3.2-3b` | `Llama-3.2-3B` | 可用，chat completion |
 | `Llama-3.2-3B-Instruct` | 同名 | 可用，chat completion |
-| `BERT-Base-Uncased` | 同名 | 可用，embeddings |
+| `BERT-Base-Uncased` | 同名 | 可用，embeddings / AG News 英文分类 |
 
 ModelSplit 已有 DeepSeek 1.5B/8B/14B 和 Meta-Llama 3.1 8B 的代码级
 adapter/config 接入，但它们还没有加入当前 scheduler catalog，不能从正式前端调度。

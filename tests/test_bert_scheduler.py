@@ -27,6 +27,10 @@ class BertSchedulerTestCase(unittest.TestCase):
             item for item in catalog if item["model_type"] == "BERT-Base-Uncased"
         )
         self.assertEqual(bert["capability"], "embeddings")
+        self.assertEqual(
+            bert["capabilities"],
+            ["embeddings", "text_classification"],
+        )
         self.assertEqual(bert["deployment_mode"], "encrypted")
         self.assertEqual(bert["strategy_kind"], "fixed_bert_encoder")
 

@@ -22,6 +22,7 @@ MODEL_REGISTRY = {
     "bert-base-uncased": {
         "architecture": "bert",
         "capability": "embeddings",
+        "capabilities": ["embeddings", "text_classification"],
         "deployment_mode": "encrypted",
         "strategy_kind": "fixed_bert_encoder",
         "num_hidden_layers": 12,
@@ -50,17 +51,19 @@ MODEL_RUNTIME_NAMES = {
 
 def list_model_catalog() -> list[dict]:
     """Return the public model capabilities supported by the scheduler."""
-    return [
-        {
+    catalog: list[dict] = []
+    for key, spec in MODEL_REGISTRY.items():
+        capability = spec.get("capability", "generation")
+        catalog.append({
             "model_type": MODEL_CANONICAL_NAMES.get(key, key),
             "runtime_model_type": MODEL_RUNTIME_NAMES.get(key, key),
             "architecture": spec["architecture"],
-            "capability": spec.get("capability", "generation"),
+            "capability": capability,
+            "capabilities": list(spec.get("capabilities", [capability])),
             "deployment_mode": spec.get("deployment_mode", "standard"),
             "strategy_kind": spec.get("strategy_kind", "algorithm"),
-        }
-        for key, spec in MODEL_REGISTRY.items()
-    ]
+        })
+    return catalog
 
 
 def uses_fixed_runtime_strategy(model_type_key: str) -> bool:

@@ -83,9 +83,9 @@ GET /api/v1/schedule/models
 Authorization: Bearer <openwebui_access_token>
 ```
 
-每项返回 `model_type`、`runtime_model_type`、`architecture`、`capability`、
-`deployment_mode` 和 `strategy_kind`。`capability=generation` 使用 chat completion；
-`capability=embeddings` 使用 embeddings。
+每项返回 `model_type`、`runtime_model_type`、`architecture`、兼容字段 `capability`、
+能力数组 `capabilities`、`deployment_mode` 和 `strategy_kind`。生成模型使用 chat
+completion；BERT 的 `capabilities` 包含 `embeddings` 和 `text_classification`。
 
 ```http
 POST /api/v1/schedule/trigger
@@ -106,7 +106,7 @@ Content-Type: application/json
 - `Llama-3.2-3B-Instruct`
 - `BERT-Base-Uncased`
 
-其中两种 Llama 提供生成接口，BERT 提供 embeddings 接口。ModelSplit 已有代码级
+其中两种 Llama 提供生成接口，BERT 提供 embeddings 和英文分类接口。ModelSplit 已有代码级
 adapter/config 接入但 scheduler 尚未登记的 DeepSeek/Meta-Llama 模型不能直接从
 正式前端选择；这也不代表相关模型已经完成真实权重端到端验收。
 
@@ -177,6 +177,20 @@ Content-Type: application/json
 
 `input` 可以是一个字符串或最多 16 个字符串；数组响应按输入顺序返回。`data[*].embedding` 固定为 768 个 float，`usage` 是整批输入 token 数。该数据面请求不经过 cloud backend；
 backend 只负责提前完成模型、slot 和边云路由准备。
+
+AG News 英文四分类直接调用所选边端 Coordinator；请求必须在同一个 BERT 调度任务
+完成后发出：
+
+```http
+POST http://<edge-ip>:9000/text_classification
+Content-Type: application/json
+
+{"model_name":"BERT-Base-Uncased","text":"Apple announced a new processor."}
+```
+
+响应包含 `World`、`Sports`、`Business`、`Sci/Tech` 四类概率、最终标签，以及
+classification head、Encoder 和 Tokenizer 指纹。该接口是单文本分类，不是 chat，
+也不经过 cloud backend 代理。
 
 ## 5. SSE 订阅
 
