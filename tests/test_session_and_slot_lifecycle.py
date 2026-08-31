@@ -1706,6 +1706,98 @@ class SessionAndSlotLifecycleTest(unittest.TestCase):
         self.assertEqual(payload["cloud_integrity_progress"], 70)
         self.assertEqual(payload["cloud_runtime_load_progress"], 40)
 
+    def test_ready_callback_promotes_starting_process_to_running(self) -> None:
+        self._create_session()
+        db = SessionLocal()
+        try:
+            binding = RuntimeBinding(
+                binding_id="binding-ready-process-state",
+                session_id="session-1",
+                task_id="task-ready-process-state",
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                status="binding",
+            )
+            task = ScheduleTask(
+                task_id="task-ready-process-state",
+                openwebui_user_id="user-1",
+                edge_session_id="session-1",
+                runtime_binding_id=binding.binding_id,
+                model_type="Llama-3.2-3B-Instruct",
+                status="running",
+                phase="loading",
+                phase_progress=50,
+                overall_progress=75,
+                message="cloud is becoming ready",
+                edge_device_id="edge_A",
+                cloud_device_id="cloud",
+                edge_progress=100,
+                cloud_progress=50,
+                edge_strategy_progress=100,
+                edge_integrity_progress=100,
+                edge_runtime_load_progress=100,
+                cloud_strategy_progress=100,
+                cloud_integrity_progress=100,
+                cloud_runtime_load_progress=50,
+                edge_status="ready",
+                cloud_status="loading",
+                queue_status="running_loading",
+                queue_position=0,
+                edge_slot_id="edge-slot-edge_A",
+                cloud_slot_id="cloud-slot-0",
+                allocated_cloud_slot_id="cloud-slot-0",
+                edge_message="edge ready",
+                cloud_message="cloud loading",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add_all([binding, task])
+            db.commit()
+
+            cloud_slot = ensure_runtime_slot(
+                db,
+                slot_id="cloud-slot-0",
+                role="cloud",
+                control_url="http://127.0.0.1:19113/load_strategy",
+                process_state="starting",
+            )
+            transition_runtime_slot(
+                db,
+                cloud_slot,
+                slot_state="bound",
+                model_state="loading",
+                owner_session_id="session-1",
+                owner_binding_id=binding.binding_id,
+                task_id=task.task_id,
+                model_type=task.model_type,
+            )
+        finally:
+            db.close()
+
+        from types import SimpleNamespace
+        from app.services.schedule_orchestrator import handle_runtime_progress
+
+        result = asyncio.run(handle_runtime_progress(SimpleNamespace(
+            task_id="task-ready-process-state",
+            status="ready",
+            progress=100,
+            message="cloud ready",
+            stage="runtime_load",
+            node_role="cloud",
+        )))
+
+        self.assertEqual(result["status"], "success")
+        db = SessionLocal()
+        try:
+            cloud_slot = db.query(RuntimeSlot).filter(
+                RuntimeSlot.slot_id == "cloud-slot-0"
+            ).first()
+            self.assertIsNotNone(cloud_slot)
+            self.assertEqual(cloud_slot.process_state, "running")
+            self.assertEqual(cloud_slot.model_state, "ready")
+        finally:
+            db.close()
+
     def test_schedule_runtime_observability_endpoints(self) -> None:
         self._create_session()
         db = SessionLocal()

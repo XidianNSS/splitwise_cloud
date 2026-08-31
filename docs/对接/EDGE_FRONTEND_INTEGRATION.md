@@ -19,7 +19,8 @@ http://10.144.144.4:8010
 
 模型选择前可调用 `GET /api/v1/schedule/models`。生成模型在任务完成后调用
 边端 `/v1/chat/completions`；`BERT-Base-Uncased` 调用边端 `/v1/embeddings`，
-输入文本后返回 768 维向量，不会返回对话文本。
+输入文本后返回 768 维向量；AG News 英文四分类调用边端 Coordinator
+`/text_classification`。两个 BERT 接口都不会返回对话文本。
 
 `/schedule/models` 是 scheduler catalog，边端 `/v1/models` 是该节点的 runtime/OpenAI 注册表。正式前端只应展示两者交集。
 

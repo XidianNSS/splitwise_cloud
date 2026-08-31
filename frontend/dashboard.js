@@ -215,11 +215,10 @@ function switchGrafanaDevice() {
     const ip = val.split(":")[0];
     const isAscend = val.includes(":9500");
     const dashboardId = isAscend ? "addfqnr/e0d73c7" : "ad9hqhg/b9a97b3";
-    const grafanaBaseUrl = `${window.location.protocol}//${window.location.hostname}:3000`;
+    const grafanaBaseUrl = `${window.location.protocol}//${window.location.hostname}:3001`;
 
     document.getElementById("grafana-frame").src =
         `${grafanaBaseUrl}/d/${dashboardId}?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(ip)}`;
-    // document.getElementById("grafana-frame").src = `http://10.144.144.2:3000/d/${dashboardId}?orgId=1&from=now-6h&to=now&timezone=browser&refresh=auto&kiosk&var-device=${encodeURIComponent(ip)}`;
 }
 //新增判断是否是昇腾，若是昇腾，则展示grafana中昇腾专属dashborad，若不是，则展示用户监控大屏dashboard
 

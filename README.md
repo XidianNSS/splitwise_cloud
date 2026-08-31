@@ -192,6 +192,8 @@ adapter/config 接入，但它们还没有加入当前 scheduler catalog，不�
 ```text
 backend:             10.144.144.4:8010
 algorithm API:       10.144.144.6:8050
+Prometheus:          10.144.144.4:9091
+Grafana:             10.144.144.4:3001
 cloud-slot-0 HTTP:   10.144.144.4:9020
 cloud-slot-0 gRPC:   10.144.144.4:51200
 cloud-slot-1 HTTP:   10.144.144.4:9021
@@ -224,6 +226,23 @@ curl -sS http://127.0.0.1:9020/runtime_state
 ```
 
 backend 当前没有 `/health` 路由；根 dashboard 返回 `200` 可用于 HTTP 存活检查。
+
+## 监控与调度指标
+
+Prometheus 不只是展示组件：scheduler 的资源预检查和算法请求依赖其 CPU、内存及
+逐卡 GPU/NPU 指标。正式调度前至少启动 Prometheus，并确保三台机器的
+node-exporter、两台边端的 DCGM exporter 和云端 Ascend exporter 可被抓取：
+
+```bash
+docker-compose --env-file monitor/.env -f monitor/docker-compose.yml up -d prometheus grafana
+curl -fsS http://127.0.0.1:9091/-/ready
+curl -fsS 'http://127.0.0.1:9091/api/v1/targets?state=active'
+curl -fsS http://127.0.0.1:3001/api/health
+```
+
+正式云端的 3000 端口由 Open WebUI 使用，因此 Grafana 使用 3001。若 Prometheus
+不可达，指标查询会回退为诊断用默认值，但不能将这些值视为真实资源余量；正式模型
+调度前必须确认所有 node/GPU/NPU target 均为 `up`。
 
 ## 数据与恢复
 

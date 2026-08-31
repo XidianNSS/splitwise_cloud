@@ -1823,6 +1823,7 @@ async def handle_runtime_progress(payload, callback_role: str | None = None) -> 
             slot_fields.update(model_state="loading", slot_state="bound")
         elif node_status in {"ready", "completed"}:
             slot_fields.update(
+                process_state="running",
                 model_state="ready",
                 slot_state="bound",
                 integrity_status="healthy",
