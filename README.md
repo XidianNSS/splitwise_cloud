@@ -11,6 +11,7 @@
 - 向 edge prefill 和 cloud decode 下发 `/load_strategy`。
 - 聚合 strategy/integrity/runtime-load 三段进度。
 - 管理 edge/cloud slot、binding、session lease 和资源回收。
+- 调度任务失败时，在同一事务释放该任务未持有 slot 的 pending binding；旧模型或已拥有 slot 的绑定继续由 runtime 对账管理。
 - 启动、停止并对账 backend 托管的 cloud decode 子进程。
 - 启动时恢复任务队列和 runtime ownership，运行期间周期 reconcile。
 - 提供管理员运行态 dashboard 和只读告警信息。

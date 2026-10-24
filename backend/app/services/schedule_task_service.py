@@ -2,7 +2,8 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.models.models import ScheduleTask
+from app.models.models import RuntimeBinding, RuntimeSlot, ScheduleTask
+from app.services.runtime_state_transition_service import transition_runtime_binding
 from app.services.schedule_presenter import calc_overall_progress, calc_weighted_stage_progress, clamp_progress
 
 
@@ -143,10 +144,40 @@ def update_task(
 
 
 def fail_task(db: Session, task: ScheduleTask, message: str, error_detail: str | None = None) -> None:
-    update_task(
-        db,
-        task,
-        status="failed",
-        message=message,
-        error_detail=error_detail or message,
-    )
+    """Fail a task and release its unallocated pending binding atomically.
+
+    A bound/retained runtime, including a previous model's allocation, remains
+    protected by runtime reconciliation and active-request accounting.
+    """
+    try:
+        update_task(
+            db,
+            task,
+            status="failed",
+            message=message,
+            error_detail=error_detail or message,
+            commit=False,
+        )
+        binding = (
+            db.query(RuntimeBinding)
+            .filter(
+                RuntimeBinding.binding_id == task.runtime_binding_id,
+                RuntimeBinding.task_id == task.task_id,
+                RuntimeBinding.session_id == task.edge_session_id,
+                RuntimeBinding.status == "pending",
+            )
+            .first()
+        )
+        if binding is not None:
+            owns_slot = (
+                db.query(RuntimeSlot)
+                .filter(RuntimeSlot.owner_binding_id == binding.binding_id)
+                .first()
+            )
+            if owns_slot is None:
+                transition_runtime_binding(db, binding, status="released", commit=False)
+        db.commit()
+        db.refresh(task)
+    except Exception:
+        db.rollback()
+        raise
