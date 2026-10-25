@@ -10,6 +10,7 @@ venv/
 # 配置文件
 backend/.env
 monitor/.env
+.private/
 
 # 运行数据库与备份（保护用户数据）
 /data/

@@ -1,4 +1,20 @@
 MODEL_REGISTRY = {
+    "deepseek-r1-distill-llama-8b": {
+        "architecture": "llama",
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "vocab_size": 128256,
+        # BF16 weights are about 15 GiB. Reserve capacity for runtime/cache
+        # overhead; these startup bounds are not a long-context memory guarantee.
+        "edge_min_free_gpu_mem_mb": 16384,
+        "cloud_min_free_gpu_mem_mb": 24576,
+        # The policy may request a split FFN (2), while ModelSplit executes
+        # whole FFNs only. Project such layers to Cloud and record the change.
+        "split_ffn_fallback": "cloud",
+    },
     "llama-3.2-3b": {
         "architecture": "llama",
         "num_hidden_layers": 28,
@@ -37,12 +53,14 @@ MODEL_REGISTRY = {
 
 
 MODEL_CANONICAL_NAMES = {
+    "deepseek-r1-distill-llama-8b": "DeepSeek-R1-Distill-Llama-8B",
     "llama-3.2-3b": "Llama-3.2-3b",
     "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
     "bert-base-uncased": "BERT-Base-Uncased",
 }
 
 MODEL_RUNTIME_NAMES = {
+    "deepseek-r1-distill-llama-8b": "DeepSeek-R1-Distill-Llama-8B",
     "llama-3.2-3b": "Llama-3.2-3B",
     "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
     "bert-base-uncased": "BERT-Base-Uncased",

@@ -180,11 +180,18 @@ BACKEND_ENV_FILE=backend/.env.local bash scripts/run_server.sh
 | `Llama-3.2-3b` | `Llama-3.2-3B` | 可用，chat completion |
 | `Llama-3.2-3B-Instruct` | 同名 | 可用，chat completion |
 | `BERT-Base-Uncased` | 同名 | 可用，embeddings / AG News 英文分类 |
+| `DeepSeek-R1-Distill-Llama-8B` | 同名 | 开发接入；同机及 nss-d CUDA/Ascend 跨机隔离短序列验证通过，尚未部署 |
 
-ModelSplit 已有 DeepSeek 1.5B/8B/14B 和 Meta-Llama 3.1 8B 的代码级
+ModelSplit 已有 DeepSeek 1.5B/14B 和 Meta-Llama 3.1 8B 的代码级
 adapter/config 接入，但它们还没有加入当前 scheduler catalog，不能从正式前端调度。
-其中 8B、14B 和 Meta-Llama 3.1 8B 当前只完成配置形状与工厂路由测试，尚未完成
+其中 DeepSeek 14B 和 Meta-Llama 3.1 8B 当前只完成配置形状与工厂路由测试，尚未完成
 真实权重加载和端到端推理验收，不能视为正式可用模型。
+
+DeepSeek-R1-Distill-Llama-8B 使用 32 层/32 heads 规格，普通生成启动门槛为边端
+16 GiB、云端 24 GiB 可用显存；门槛不代表长上下文显存保证。策略中的 split FFN
+值 2 仅对该模型投影为整层 Cloud，并记录 `runtime_adjustments`。详见
+[隔离验证说明](docs/DEEPSEEK8B_VALIDATION.md)。`CLOUD_SLOT_LOG_DIR` 可为独立验证
+隔离托管进程日志，默认仍为 `/tmp/modelsplit_phase2_logs`。
 
 `OPENWEBUI_SKIP_SIGNATURE_VERIFY=true` 只适合受控联调环境。能够取得 OpenWebUI JWT secret 时应设为 `false`。
 

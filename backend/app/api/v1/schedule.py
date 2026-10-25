@@ -178,6 +178,7 @@ async def get_schedule_task_strategy(
             "strategy_kind": decision.get("strategy_kind"),
             "capability": decision.get("capability"),
             "deployment_mode": decision.get("deployment_mode"),
+            "runtime_adjustments": decision.get("runtime_adjustments", []),
         },
     }
 

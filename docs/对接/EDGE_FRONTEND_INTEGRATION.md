@@ -106,8 +106,9 @@ Content-Type: application/json
 - `Llama-3.2-3b`
 - `Llama-3.2-3B-Instruct`
 - `BERT-Base-Uncased`
+- `DeepSeek-R1-Distill-Llama-8B`（开发接入；普通生成，同机隔离验证通过）
 
-其中两种 Llama 提供生成接口，BERT 提供 embeddings 和英文分类接口。ModelSplit 已有代码级
+其中两种 Llama 3B 和 DeepSeek Llama 8B 提供生成接口，BERT 提供 embeddings 和英文分类接口。ModelSplit 已有代码级
 adapter/config 接入但 scheduler 尚未登记的 DeepSeek/Meta-Llama 模型不能直接从
 正式前端选择；这也不代表相关模型已经完成真实权重端到端验收。
 
@@ -236,12 +237,27 @@ Authorization: Bearer <openwebui_access_token>
     "cloud_head_count_total": 2,
     "strategy_kind": null,
     "capability": null,
-    "deployment_mode": null
+    "deployment_mode": null,
+    "runtime_adjustments": []
   }
 }
 ```
 
 生成模型的后三个 metadata 字段可能为 `null`；BERT 返回 `fixed_bert_encoder`、`embeddings` 和 `encrypted`。当前 runtime 的 `ffn_assignment` 只支持 `0=edge` 或 `1=cloud`。
+
+`decision.runtime_adjustments` 返回兼容执行时对算法策略所做的调整；未调整或历史任务没有记录时返回空数组。仅 DeepSeek Llama 8B 显式启用了 split FFN → Cloud 的投影，例如：
+
+```json
+{
+  "layer_id": 30,
+  "field": "ffn_assignment",
+  "requested": 2,
+  "applied": 1,
+  "reason": "runtime supports whole FFNs only; execute this FFN on Cloud"
+}
+```
+
+`layer_partitions` 展示应用后的实际分配。前端可据调整记录提示原始策略发生变化；性能评估时应保留这些记录，不能将投影后的执行视为原始 split FFN 方案。
 
 ## 7. 会话续期和关闭
 

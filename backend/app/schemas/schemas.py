@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class LoginRequest(BaseModel):
     username: str
@@ -56,6 +56,15 @@ class StrategyDisplayLayerPartition(BaseModel):
     edge_head_count: int
     cloud_head_count: int
 
+
+class RuntimeStrategyAdjustment(BaseModel):
+    layer_id: int
+    field: str
+    requested: int
+    applied: int
+    reason: str
+
+
 class StrategyDisplayDecisionPayload(BaseModel):
     layer_partitions: List[StrategyDisplayLayerPartition]
     edge_head_count_total: int
@@ -63,6 +72,7 @@ class StrategyDisplayDecisionPayload(BaseModel):
     strategy_kind: Optional[str] = None
     capability: Optional[str] = None
     deployment_mode: Optional[str] = None
+    runtime_adjustments: List[RuntimeStrategyAdjustment] = Field(default_factory=list)
 
 
 class ModelCatalogEntry(BaseModel):

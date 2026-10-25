@@ -58,6 +58,7 @@ class Settings:
     CLOUD_SLOT_HTTP_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_HTTP_BASE_PORT", "19113"))
     CLOUD_SLOT_GRPC_BASE_PORT: int = int(os.getenv("CLOUD_SLOT_GRPC_BASE_PORT", "52163"))
     CLOUD_SLOT_MAX_COUNT: int = int(os.getenv("CLOUD_SLOT_MAX_COUNT", "4"))
+    CLOUD_SLOT_LOG_DIR: str = os.getenv("CLOUD_SLOT_LOG_DIR", "/tmp/modelsplit_phase2_logs")
 
     # 多 cloud slot 的 NPU 绑定表。
     # 例如 CLOUD_SLOT_NPU_DEVICES=0,1 表示：

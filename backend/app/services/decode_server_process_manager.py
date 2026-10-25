@@ -180,7 +180,7 @@ def start_decode_server_process_for_slot(slot_id: str, slot_index: int) -> Decod
         f"cd {shlex.quote(settings.MODELSPLIT_DEV_ROOT)} && "
         f"exec {shlex.quote(python_bin)} -m app.services.decode_server.app"
     )
-    log_dir = Path('/tmp/modelsplit_phase2_logs')
+    log_dir = Path(settings.CLOUD_SLOT_LOG_DIR)
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout_path = log_dir / f"{slot_id}.out.log"
     stderr_path = log_dir / f"{slot_id}.err.log"

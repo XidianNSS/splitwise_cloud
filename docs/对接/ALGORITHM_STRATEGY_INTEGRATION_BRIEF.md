@@ -101,8 +101,9 @@ http://10.144.144.6:8050/infer
 
 - `Llama-3.2-3b`
 - `Llama-3.2-3B-Instruct`
+- `DeepSeek-R1-Distill-Llama-8B`（32 层、32 heads；开发接入，待正式三机验收）
 
-这两种 Llama 3B 会调用算法服务。BERT 使用固定 encoder 策略，不会调用本接口；DeepSeek/Meta-Llama 尚未加入 scheduler，因此当前也不会发到算法服务。
+这两种 Llama 3B 和 DeepSeek Llama 8B 会调用算法服务。BERT 使用固定 encoder 策略，不会调用本接口；其他未登记的 DeepSeek/Meta-Llama 不会发到算法服务。
 
 ### `env.edge` 和 `env.cloud`
 
@@ -145,16 +146,20 @@ HTTP 状态必须为 2xx，body 必须是 JSON：
 
 - `status`：建议始终返回 `ok`；字段存在但不为 `ok` 时 backend 判定失败。
 - `model_type`：建议原样返回；省略时 backend 使用请求值。
-- `layer_partitions`：非空数组，是唯一必需的策略结果。
-- `layer_id`：层编号。
+- `layer_partitions`：必需的非空数组，每层必须包含 `layer_id`、`head_assignments`、`ffn_assignment`。
+- `layer_id`：整数层编号。
 - `head_assignments`：每个 attention head 的归属；`0=edge`，`1=cloud`。
-- `ffn_assignment`：`0=edge`，`1=cloud`。虽然 backend 当前只做整数规范化，但下游 ModelSplit `PartitionConfig` 不接受值 `2`，算法服务不得返回 `2`。
-- `edge_heads`、`cloud_heads`：可选。省略时 backend 根据 `head_assignments` 计算；提供时必须与其一致。
+- `ffn_assignment`：runtime 支持 `0=edge`、`1=cloud`。策略值 `2` 表示 split FFN，runtime 不直接接受。仅对注册表显式配置 `split_ffn_fallback=cloud` 的 DeepSeek Llama 8B，backend 将其投影为 `1`，记录层号、请求值、应用值和原因到 `runtime_adjustments` 并告警；这会改变策略的性能含义，不代表实现了 split FFN。其他模型返回 `2` 时明确失败。
+- `edge_heads`、`cloud_heads`：可选。省略时 backend 根据 `head_assignments` 计算；提供时必须为 JSON 整数并与其一致，不能以 `null` 跳过检查。
 
-推荐每个模型返回完整层数，并保证每层的 `head_assignments` 长度等于
-`num_attention_heads`。backend 会把上述数字转换为整数，但算法服务仍应主动校验范围、层数和 head 数，避免生成可解析但无法执行的策略。
+每个模型必须返回完整且从 0 连续递增的层号，每层的 `head_assignments` 长度必须等于
+`num_attention_heads`。层号、head/FFN 分配和可选计数仅接受 JSON 整数；浮点数（包括 `1.0`）、字符串、布尔值均会被拒绝，不做截断或隐式转换。
 
-当前 backend 不会在保存前完整验证 layer 连续性、head 取值范围和 FFN 取值范围；这些错误会在 ModelSplit `/load_strategy` 阶段被拒绝并使任务失败。因此算法服务必须保证 `layer_id` 从 0 连续递增、head 仅为 `0/1`、FFN 仅为 `0/1`。
+兼容投影的 `runtime_adjustments` 随任务策略持久化，并通过
+`GET /api/v1/schedule/tasks/{task_id}/strategy` 的 `decision.runtime_adjustments`
+返回，含层号、字段、请求值、应用值和原因；未调整时返回空数组。
+
+backend 在保存前校验模型名、完整连续层号、每层 head 数、head 取值以及 FFN 范围；提供的 head 计数也必须与分配列表一致。非法结果在下发 runtime 前失败。
 
 ## 4. 失败响应
 

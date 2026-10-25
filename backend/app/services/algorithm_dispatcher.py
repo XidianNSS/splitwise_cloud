@@ -8,11 +8,19 @@ from app.services.model_registry import (
     MODEL_REGISTRY,
     build_fixed_runtime_decision,
     uses_fixed_runtime_strategy,
+    resolve_model_type_key,
 )
 
 logger = logging.getLogger("AlgorithmDispatcher")
 
 DEFAULT_PROMPT_LEN = 96
+
+
+def _require_policy_integer(value: object, field_name: str) -> int:
+    # JSON booleans are Python int subclasses; do not accept them as assignments.
+    if type(value) is not int:
+        raise ValueError(f"算法模块的 {field_name} 必须为 JSON 整数")
+    return value
 
 
 def normalize_device_runtime_label(metrics: dict) -> str:
@@ -71,36 +79,68 @@ def normalize_algorithm_decision(model_type: str, payload: dict) -> dict:
     if not isinstance(raw_layers, list) or not raw_layers:
         raise ValueError("算法模块未返回有效的 layer_partitions")
 
+    model_key = resolve_model_type_key(model_type)
+    spec = MODEL_REGISTRY.get(model_key, {})
+    response_model = str(payload.get("model_type") or model_type)
+    if model_key and resolve_model_type_key(response_model) != model_key:
+        raise ValueError("算法模块返回的 model_type 与请求不一致")
     normalized_layers = []
+    adjustments = []
     for raw_layer in raw_layers:
         if not isinstance(raw_layer, dict):
             raise ValueError("算法模块返回的 layer_partitions 格式非法")
 
-        head_assignments = [int(assignment) for assignment in raw_layer.get("head_assignments", [])]
+        raw_heads = raw_layer.get("head_assignments")
+        if not isinstance(raw_heads, list):
+            raise ValueError("算法模块的 head_assignments 必须为数组")
+        head_assignments = [
+            _require_policy_integer(assignment, "head_assignments")
+            for assignment in raw_heads
+        ]
+        if any(value not in (0, 1) for value in head_assignments):
+            raise ValueError("算法模块的 head_assignments 只允许 0/1")
+        if spec and len(head_assignments) != spec["num_attention_heads"]:
+            raise ValueError("算法模块返回的 attention head 数与模型规格不一致")
+        layer_id = _require_policy_integer(raw_layer.get("layer_id"), "layer_id")
+        ffn_assignment = _require_policy_integer(raw_layer.get("ffn_assignment"), "ffn_assignment")
+        if ffn_assignment == 2 and spec.get("split_ffn_fallback") == "cloud":
+            ffn_assignment = 1
+            adjustments.append({
+                "layer_id": layer_id, "field": "ffn_assignment",
+                "requested": 2, "applied": 1,
+                "reason": "runtime supports whole FFNs only; execute this FFN on Cloud",
+            })
+        if ffn_assignment not in (0, 1):
+            raise ValueError("runtime 不支持算法模块返回的 FFN 分配；只允许 0/1")
         edge_head_count = sum(1 for assignment in head_assignments if assignment == 0)
         cloud_head_count = sum(1 for assignment in head_assignments if assignment == 1)
 
-        provided_edge_heads = raw_layer.get("edge_heads")
-        provided_cloud_heads = raw_layer.get("cloud_heads")
-        if isinstance(provided_edge_heads, int):
-            edge_head_count = provided_edge_heads
-        if isinstance(provided_cloud_heads, int):
-            cloud_head_count = provided_cloud_heads
+        for field_name, expected in (("edge_heads", edge_head_count), ("cloud_heads", cloud_head_count)):
+            if field_name in raw_layer:
+                provided = _require_policy_integer(raw_layer[field_name], field_name)
+                if provided != expected:
+                    raise ValueError(f"算法模块的 {field_name} 与 head_assignments 不一致")
 
         normalized_layers.append(
             {
-                "layer_id": int(raw_layer.get("layer_id", 0)),
+                "layer_id": layer_id,
                 "head_assignments": head_assignments,
-                "ffn_assignment": int(raw_layer.get("ffn_assignment", 0)),
+                "ffn_assignment": ffn_assignment,
                 "edge_head_count": edge_head_count,
                 "cloud_head_count": cloud_head_count,
             }
         )
 
-    return {
-        "model_type": str(payload.get("model_type") or model_type),
+    if spec and [layer["layer_id"] for layer in normalized_layers] != list(range(spec["num_hidden_layers"])):
+        raise ValueError("算法模块返回的 layer_id 必须覆盖模型全部层且从 0 连续递增")
+    decision = {
+        "model_type": model_type,
         "layer_partitions": normalized_layers,
     }
+    if adjustments:
+        decision["runtime_adjustments"] = adjustments
+        logger.warning("策略经过 runtime 兼容调整: model=%s adjustments=%s", model_type, adjustments)
+    return decision
 
 
 def derive_edge_storage_limit_gb_from_metrics(edge_metrics: dict) -> float:
