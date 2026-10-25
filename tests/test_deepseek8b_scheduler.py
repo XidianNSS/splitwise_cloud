@@ -47,12 +47,13 @@ class DeepSeek8BSchedulerTest(unittest.TestCase):
                 elif change == "head_totals": payload["layer_partitions"][0]["edge_heads"] = 31
                 with self.assertRaises(ValueError): normalize_algorithm_decision(self.name, payload)
 
-    def test_existing_models_do_not_silently_project_split_ffn(self):
+    def test_ffn_projection_is_not_conditioned_on_encoder_model_identity(self):
         payload = {"layer_partitions": [{
-            "layer_id": i, "head_assignments": [0] * 24, "ffn_assignment": 2,
-        } for i in range(28)]}
-        with self.assertRaisesRegex(ValueError, "FFN"):
-            normalize_algorithm_decision("Llama-3.2-3B", payload)
+            "layer_id": i, "head_assignments": [1] * 12, "ffn_assignment": 2,
+        } for i in range(12)]}
+        result = normalize_algorithm_decision("BERT-Base-Uncased", payload)
+        self.assertEqual(len(result["runtime_adjustments"]), 12)
+        self.assertTrue(all(row["ffn_assignment"] == 1 for row in result["layer_partitions"]))
 
     def test_policy_integer_fields_reject_coercion(self):
         for field in ("layer_id", "ffn_assignment", "head_assignments"):

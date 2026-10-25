@@ -245,7 +245,7 @@ Authorization: Bearer <openwebui_access_token>
 
 生成模型的后三个 metadata 字段可能为 `null`；BERT 返回 `fixed_bert_encoder`、`embeddings` 和 `encrypted`。当前 runtime 的 `ffn_assignment` 只支持 `0=edge` 或 `1=cloud`。
 
-`decision.runtime_adjustments` 返回兼容执行时对算法策略所做的调整；未调整或历史任务没有记录时返回空数组。仅 DeepSeek Llama 8B 显式启用了 split FFN → Cloud 的投影，例如：
+`decision.runtime_adjustments` 返回兼容执行时对算法策略所做的调整；未调整或历史任务没有记录时返回空数组。算法返回的 FFN `2` 统一转为整层 Cloud `1`，不区分模型；已有 `0/1` 和 head 分配保持不变。以下示例来自 DeepSeek Llama 8B 的编号 30 层：
 
 ```json
 {

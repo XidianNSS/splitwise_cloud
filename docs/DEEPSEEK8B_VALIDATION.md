@@ -10,10 +10,11 @@ BF16 权重约 14.96 GiB；启动准入保守设置边端 16 GiB、云端 24 GiB
 保留额外运行开销。此下限不是任意上下文长度的显存保证。
 
 真实 policy_api 返回过 `ffn_assignment=2`，表示 FFN 半边/半云执行。现有 runtime
-仅支持整层 FFN。因此该模型通过显式 `split_ffn_fallback=cloud` 选择整层 Cloud，
-保留 head 分配，将每项调整写入 `runtime_adjustments` 和告警日志。策略查询接口的
+仅支持整层 FFN。2026-10-25 起，统一策略处理入口将所有模型返回的 FFN `2`
+转换为整层 Cloud `1`，不再配置单模型的 `split_ffn_fallback`；原有 `0/1` 和 head 分配保留，
+每项调整写入 `runtime_adjustments` 和告警日志。策略查询接口的
 `decision.runtime_adjustments` 返回相同的结构化记录，未调整及历史任务返回空数组。不会修改原始
-响应对象或正式策略服务，也不对其他模型自动启用投影。此选择改变预测性能方案，
+响应对象或正式策略服务。BERT 固定策略不走动态算法，其分配不变。此选择改变预测性能方案，
 不能宣称运行的是算法原始 split FFN。所有模型的返回策略在下发前检查模型身份、
 层数/层号、head 维度/取值、可选计数和 FFN 值。所有分配、层号及提供的计数必须
 为 JSON 整数，拒绝浮点数、字符串、布尔值和 `null`，避免截断或跳过检查。
@@ -65,7 +66,7 @@ decode attention mask 时序问题。两个补全样例的连续 12 个 greedy t
 CPU 测试：
 
 ```bash
-python -m unittest tests.test_deepseek8b_scheduler tests.test_strategy_adjustments_api -v
+python -m unittest tests.test_deepseek8b_scheduler tests.test_ffn_policy_compatibility tests.test_strategy_adjustments_api tests.test_bert_scheduler -v
 ```
 
 当前三机开发环境可显式执行 `scripts/validate_model_schedule.py`，指定隔离

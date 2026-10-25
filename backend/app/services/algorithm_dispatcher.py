@@ -103,7 +103,7 @@ def normalize_algorithm_decision(model_type: str, payload: dict) -> dict:
             raise ValueError("算法模块返回的 attention head 数与模型规格不一致")
         layer_id = _require_policy_integer(raw_layer.get("layer_id"), "layer_id")
         ffn_assignment = _require_policy_integer(raw_layer.get("ffn_assignment"), "ffn_assignment")
-        if ffn_assignment == 2 and spec.get("split_ffn_fallback") == "cloud":
+        if ffn_assignment == 2:
             ffn_assignment = 1
             adjustments.append({
                 "layer_id": layer_id, "field": "ffn_assignment",

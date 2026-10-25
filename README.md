@@ -189,7 +189,9 @@ adapter/config 接入，但它们还没有加入当前 scheduler catalog，不�
 
 DeepSeek-R1-Distill-Llama-8B 使用 32 层/32 heads 规格，普通生成启动门槛为边端
 16 GiB、云端 24 GiB 可用显存；门槛不代表长上下文显存保证。策略中的 split FFN
-值 2 仅对该模型投影为整层 Cloud，并记录 `runtime_adjustments`。详见
+值 2 在统一策略处理入口一律投影为整层 Cloud，不按模型区分，并记录
+`runtime_adjustments`；已有 0/1 和 attention head 分配保留。BERT 固定策略不调用
+动态算法，其既有分配保持不变。详见
 [隔离验证说明](docs/DEEPSEEK8B_VALIDATION.md)。`CLOUD_SLOT_LOG_DIR` 可为独立验证
 隔离托管进程日志，默认仍为 `/tmp/modelsplit_phase2_logs`。
 

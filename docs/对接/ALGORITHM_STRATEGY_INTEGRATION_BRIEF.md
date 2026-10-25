@@ -149,7 +149,7 @@ HTTP 状态必须为 2xx，body 必须是 JSON：
 - `layer_partitions`：必需的非空数组，每层必须包含 `layer_id`、`head_assignments`、`ffn_assignment`。
 - `layer_id`：整数层编号。
 - `head_assignments`：每个 attention head 的归属；`0=edge`，`1=cloud`。
-- `ffn_assignment`：runtime 支持 `0=edge`、`1=cloud`。策略值 `2` 表示 split FFN，runtime 不直接接受。仅对注册表显式配置 `split_ffn_fallback=cloud` 的 DeepSeek Llama 8B，backend 将其投影为 `1`，记录层号、请求值、应用值和原因到 `runtime_adjustments` 并告警；这会改变策略的性能含义，不代表实现了 split FFN。其他模型返回 `2` 时明确失败。
+- `ffn_assignment`：runtime 支持 `0=edge`、`1=cloud`。策略值 `2` 表示 split FFN，runtime 不直接接受。backend 在统一策略处理入口将所有 `2` 转为整层 Cloud `1`，不检查模型名称或注册表特例；原有 `0/1` 和 head 分配保留。每项调整记录层号、请求值、应用值和原因到 `runtime_adjustments` 并告警；这会改变策略的性能含义，不代表实现了 split FFN。其他值及非整数仍明确失败。BERT 的固定 encoder 策略不请求算法，其既有整层分配保持不变。
 - `edge_heads`、`cloud_heads`：可选。省略时 backend 根据 `head_assignments` 计算；提供时必须为 JSON 整数并与其一致，不能以 `null` 跳过检查。
 
 每个模型必须返回完整且从 0 连续递增的层号，每层的 `head_assignments` 长度必须等于

@@ -11,9 +11,6 @@ MODEL_REGISTRY = {
         # overhead; these startup bounds are not a long-context memory guarantee.
         "edge_min_free_gpu_mem_mb": 16384,
         "cloud_min_free_gpu_mem_mb": 24576,
-        # The policy may request a split FFN (2), while ModelSplit executes
-        # whole FFNs only. Project such layers to Cloud and record the change.
-        "split_ffn_fallback": "cloud",
     },
     "llama-3.2-3b": {
         "architecture": "llama",

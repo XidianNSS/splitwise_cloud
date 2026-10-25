@@ -39,20 +39,20 @@ class StrategyAdjustmentsApiTest(unittest.IsolatedAsyncioTestCase):
         self.app.dependency_overrides.clear()
         self.engine.dispose()
 
-    def persist_decision(self, decision):
+    def persist_decision(self, decision, *, model_type="DeepSeek-R1-Distill-Llama-8B", task_id="strategy-test-task"):
         with self.sessions() as db:
             db.add(ScheduleTask(
-                task_id="strategy-test-task", openwebui_user_id="strategy-test-user",
-                model_type="DeepSeek-R1-Distill-Llama-8B",
+                task_id=task_id, openwebui_user_id="strategy-test-user",
+                model_type=model_type,
                 strategy_payload=json.dumps(decision),
             ))
             db.commit()
 
-    async def fetch_strategy(self):
+    async def fetch_strategy(self, *, task_id="strategy-test-task"):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=self.app), base_url="http://testserver",
         ) as client:
-            response = await client.get("/api/v1/schedule/tasks/strategy-test-task/strategy")
+            response = await client.get(f"/api/v1/schedule/tasks/{task_id}/strategy")
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["decision"]
 
@@ -69,6 +69,25 @@ class StrategyAdjustmentsApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(displayed["layer_partitions"][30]["ffn_assignment"], 1)
         self.assertEqual(displayed["runtime_adjustments"][0]["requested"], 2)
         self.assertEqual(payload["layer_partitions"][30]["ffn_assignment"], 2)
+
+    async def test_legacy_generation_models_expose_projection_through_api(self):
+        for index, name in enumerate(("Llama-3.2-3B", "Llama-3.2-3B-Instruct")):
+            with self.subTest(model=name):
+                payload = {"layer_partitions": [{
+                    "layer_id": i, "head_assignments": [0, 1] * 12,
+                    "ffn_assignment": 2 if i == 27 else i % 2,
+                } for i in range(28)]}
+                decision = normalize_algorithm_decision(name, payload)
+                task_id = f"legacy-task-{index}"
+                self.persist_decision(decision, model_type=name, task_id=task_id)
+                displayed = await self.fetch_strategy(task_id=task_id)
+                self.assertEqual(displayed["runtime_adjustments"], decision["runtime_adjustments"])
+                self.assertEqual(displayed["layer_partitions"][27]["ffn_assignment"], 1)
+                self.assertEqual(displayed["layer_partitions"][0]["ffn_assignment"], 0)
+                self.assertEqual(displayed["layer_partitions"][1]["ffn_assignment"], 1)
+                self.assertEqual(displayed["edge_head_count_total"], 28 * 12)
+                self.assertEqual(displayed["cloud_head_count_total"], 28 * 12)
+                self.assertEqual(payload["layer_partitions"][27]["ffn_assignment"], 2)
 
     async def test_older_strategy_without_adjustments_returns_empty_list(self):
         self.persist_decision({"layer_partitions": [{
