@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--physical-npu", required=True, type=int)
     parser.add_argument("--base-port", type=int, default=28310)
     parser.add_argument("--policy-url", default="http://10.144.144.6:8050/infer")
+    parser.add_argument("--output-root", type=Path, help="Artifact directory inside this clone's .private directory")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     runtime_root = args.modelsplit_root.resolve()
@@ -65,14 +66,21 @@ def main():
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", port))
 
-    directory = root / ".private" / "deepseek8b-validation" / f"schedule-{int(time.time())}"
+    artifact_root = args.output_root or root / ".private" / "deepseek8b-validation"
+    if not artifact_root.is_absolute():
+        artifact_root = root / artifact_root
+    artifact_root = artifact_root.resolve()
+    if not artifact_root.is_relative_to((root / ".private").resolve()):
+        raise SystemExit("Validation artifacts must stay inside this clone's .private directory")
+    directory = artifact_root / f"schedule-{int(time.time())}"
     directory.mkdir(parents=True)
     registry = directory / "registry.json"
     registry.write_text(json.dumps({"models": [{
         "model_type": args.model_name, "model_path": str(args.model_path.resolve()),
     }]}))
     report = {"model": args.model_name, "physical_npu": args.physical_npu,
-              "visible_device": visible, "same_host_validation": True, "directory": str(directory)}
+              "visible_device": visible, "same_host_validation": True,
+              "policy_api_url": args.policy_url, "directory": str(directory)}
     report_path = directory / "result.json"
     processes = []
     handles = []
@@ -86,7 +94,7 @@ def main():
         "ASCEND_RT_VISIBLE_DEVICES": visible, "CUDA_VISIBLE_DEVICES": "",
         "MODEL_DEVICE": "npu:0", "MODEL_NAME": args.model_name,
         "ENV_FILE": "/dev/null", "BACKEND_ENV_FILE": "/dev/null",
-        "APP_ENV": "deepseek_validation", "PYTHONDONTWRITEBYTECODE": "1",
+        "APP_ENV": "model_validation", "PYTHONDONTWRITEBYTECODE": "1",
         "OMP_NUM_THREADS": "4", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         "SQLITE_DB_PATH": str(directory / "scheduler.db"),
         "SERVER_HOST": "127.0.0.1", "SERVER_PORT": str(backend_port),
@@ -188,7 +196,7 @@ uvicorn.run(app,host='127.0.0.1',port=settings.PORT)
             for port in (edge_port, coordinator_port, openai_port, cloud_port):
                 await ready(f"http://127.0.0.1:{port}/health")
             assert_no_other_card_users(allowed_test_pids())
-            token = jwt.encode({"id": "isolated-deepseek8b", "sub": "validation", "exp": int(time.time()) + 3600}, key, algorithm="HS256")
+            token = jwt.encode({"id": "isolated-model-validation", "sub": "validation", "exp": int(time.time()) + 3600}, key, algorithm="HS256")
             headers = {"Authorization": "Bearer " + token}
             response = await client.get(base + "/api/v1/schedule/models", headers=headers)
             response.raise_for_status()
@@ -224,6 +232,11 @@ uvicorn.run(app,host='127.0.0.1',port=settings.PORT)
                 assert state["ready"] and state["task_id"] == task_id
                 states[name] = state
             report["runtime_states"] = states
+            report["npu_smi_after_ready"] = subprocess.check_output(["npu-smi", "info"], text=True)
+            response = await client.get(base + f"/api/v1/schedule/tasks/{task_id}/strategy", headers=headers)
+            response.raise_for_status()
+            report["display_strategy"] = response.json()
+            assert "runtime_adjustments" in report["display_strategy"]["decision"]
             assert states["edge"]["runtime_route"]["cloud_decode_grpc_target"] == f"127.0.0.1:{cloud_grpc}"
             api = f"http://127.0.0.1:{openai_port}/v1/chat/completions"
             payload = {"model": args.model_name, "messages": [{"role": "user", "content": "Name the capital of France. Answer briefly."}], "temperature": 0, "max_tokens": 24}
@@ -236,6 +249,14 @@ uvicorn.run(app,host='127.0.0.1',port=settings.PORT)
                 events = [line async for line in response.aiter_lines() if line]
             assert "data: [DONE]" in events
             report["stream_event_count"] = len(events)
+            report["stream_events"] = events
+            report["active_counts_after_inference"] = {}
+            for name, port in (("edge", edge_port), ("cloud", cloud_port)):
+                response = await client.get(f"http://127.0.0.1:{port}/runtime_state")
+                response.raise_for_status()
+                active_count = response.json()["active_request_count"]
+                assert active_count == 0
+                report["active_counts_after_inference"][name] = active_count
             response = await client.post(base + "/api/v1/session/close", headers=headers, json={"session_id": session_id})
             response.raise_for_status()
             report["session_closed"] = True

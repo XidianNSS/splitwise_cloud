@@ -102,8 +102,9 @@ http://10.144.144.6:8050/infer
 - `Llama-3.2-3b`
 - `Llama-3.2-3B-Instruct`
 - `DeepSeek-R1-Distill-Llama-8B`（32 层、32 heads；开发接入，待正式三机验收）
+- `Meta-Llama-3.1-8B-Instruct`（32 层、32 heads；临时开发接入，仅本机实验通过）
 
-这两种 Llama 3B 和 DeepSeek Llama 8B 会调用算法服务。BERT 使用固定 encoder 策略，不会调用本接口；其他未登记的 DeepSeek/Meta-Llama 不会发到算法服务。
+这两种 Llama 3B、DeepSeek Llama 8B 和 Meta Llama 3.1 8B 会调用算法服务。BERT 使用固定 encoder 策略，不会调用本接口；其他未登记的 DeepSeek/Meta-Llama 不会发到算法服务。
 
 ### `env.edge` 和 `env.cloud`
 

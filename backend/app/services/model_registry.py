@@ -1,4 +1,15 @@
 MODEL_REGISTRY = {
+    "meta-llama-3.1-8b-instruct": {
+        "architecture": "llama",
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "vocab_size": 128256,
+        "edge_min_free_gpu_mem_mb": 16384,
+        "cloud_min_free_gpu_mem_mb": 24576,
+    },
     "deepseek-r1-distill-llama-8b": {
         "architecture": "llama",
         "num_hidden_layers": 32,
@@ -50,6 +61,7 @@ MODEL_REGISTRY = {
 
 
 MODEL_CANONICAL_NAMES = {
+    "meta-llama-3.1-8b-instruct": "Meta-Llama-3.1-8B-Instruct",
     "deepseek-r1-distill-llama-8b": "DeepSeek-R1-Distill-Llama-8B",
     "llama-3.2-3b": "Llama-3.2-3b",
     "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
@@ -57,6 +69,7 @@ MODEL_CANONICAL_NAMES = {
 }
 
 MODEL_RUNTIME_NAMES = {
+    "meta-llama-3.1-8b-instruct": "Meta-Llama-3.1-8B-Instruct",
     "deepseek-r1-distill-llama-8b": "DeepSeek-R1-Distill-Llama-8B",
     "llama-3.2-3b": "Llama-3.2-3B",
     "llama-3.2-3b-instruct": "Llama-3.2-3B-Instruct",
